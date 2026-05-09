@@ -51,7 +51,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         http_client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(resolved.request_timeout_secs))
+            .timeout(Duration::from_secs(resolved.request_timeout))
             .build()
             .expect("Failed to build HTTP client"),
         config: resolved,
@@ -93,9 +93,10 @@ fn check_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    match auth_header {
-        Some(key) if config.auth_keys.iter().any(|k| k == key) => Ok(()),
-        _ => Err((
+    if auth_header.is_some_and(|key| config.auth_keys.contains(key)) {
+        Ok(())
+    } else {
+        Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "error": {
@@ -103,7 +104,7 @@ fn check_auth(
                     "message": "Invalid or missing API key",
                 }
             })),
-        )),
+        ))
     }
 }
 

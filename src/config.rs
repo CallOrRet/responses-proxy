@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -15,8 +15,8 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
-    #[serde(default = "default_timeout")]
-    pub request_timeout_secs: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u64,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default = "default_tool_allowlist")]
@@ -53,7 +53,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_listen_addr(),
-            request_timeout_secs: default_timeout(),
+            request_timeout: default_request_timeout(),
             auth: AuthConfig::default(),
             tool_type_allowlist: default_tool_allowlist(),
         }
@@ -64,8 +64,8 @@ fn default_listen_addr() -> String {
     "0.0.0.0:3000".into()
 }
 
-fn default_timeout() -> u64 {
-    120
+fn default_request_timeout() -> u64 {
+    30
 }
 
 /// Resolved provider config with API key resolved from env if needed.
@@ -80,9 +80,9 @@ pub struct ResolvedProvider {
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub listen_addr: String,
-    pub request_timeout_secs: u64,
+    pub request_timeout: u64,
     pub auth_enabled: bool,
-    pub auth_keys: Vec<String>,
+    pub auth_keys: HashSet<String>,
     pub tool_type_allowlist: Vec<String>,
     pub models: HashMap<String, ResolvedProvider>,
     /// Ordered list of model names for /v1/models
@@ -144,9 +144,9 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
 
     Ok(ResolvedConfig {
         listen_addr: config.server.listen_addr,
-        request_timeout_secs: config.server.request_timeout_secs,
+        request_timeout: config.server.request_timeout,
         auth_enabled: config.server.auth.enabled,
-        auth_keys: config.server.auth.keys,
+        auth_keys: config.server.auth.keys.into_iter().collect::<HashSet<_>>(),
         tool_type_allowlist: config.server.tool_type_allowlist,
         models,
         model_names,
@@ -173,7 +173,7 @@ models:
 "#;
         let c = parse(yaml).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:3000");
-        assert_eq!(c.request_timeout_secs, 120);
+        assert_eq!(c.request_timeout, 30);
         assert!(!c.auth_enabled);
         assert!(c.auth_keys.is_empty());
         assert_eq!(c.tool_type_allowlist, vec!["function"]);
@@ -189,7 +189,7 @@ models:
         let yaml = r#"
 server:
   listen_addr: "127.0.0.1:8080"
-  request_timeout_secs: 60
+  request_timeout: 60
   auth:
     enabled: true
     keys:
@@ -208,9 +208,14 @@ models:
 "#;
         let c = parse(yaml).unwrap();
         assert_eq!(c.listen_addr, "127.0.0.1:8080");
-        assert_eq!(c.request_timeout_secs, 60);
+        assert_eq!(c.request_timeout, 60);
         assert!(c.auth_enabled);
-        assert_eq!(c.auth_keys, vec!["sk-secret-1", "sk-secret-2"]);
+        assert_eq!(
+            c.auth_keys,
+            ["sk-secret-1".into(), "sk-secret-2".into()]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
         assert_eq!(
             c.tool_type_allowlist,
             vec!["function", "web_search_preview"]
@@ -232,7 +237,7 @@ models:
 "#;
         let c = parse(yaml).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:3000");
-        assert_eq!(c.request_timeout_secs, 120);
+        assert_eq!(c.request_timeout, 30);
         assert!(!c.auth_enabled);
     }
 

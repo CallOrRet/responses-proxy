@@ -43,7 +43,7 @@ curl http://localhost:3000/v1/responses \
 ```yaml
 server:
   listen_addr: "0.0.0.0:3000"
-  request_timeout_secs: 120
+  request_timeout: 30
 
   # Authentication (optional)
   auth:
@@ -161,7 +161,7 @@ curl http://localhost:3000/v1/responses \
 ```yaml
 server:
   listen_addr: "0.0.0.0:3000"
-  request_timeout_secs: 120
+  request_timeout: 30
 
   # 鉴权配置（可选）
   auth:

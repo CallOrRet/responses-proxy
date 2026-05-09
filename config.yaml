@@ -1,6 +1,6 @@
 server:
   listen_addr: "0.0.0.0:3000"
-  request_timeout_secs: 120
+  request_timeout: 30
 
   # Auth: set enabled: true to require API key authentication
   auth:
