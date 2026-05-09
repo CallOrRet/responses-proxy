@@ -7,14 +7,33 @@
 <a name="english"></a>
 ## English
 
-A proxy that converts **OpenAI Responses API** requests into **Chat Completions API** format and back, enabling any Chat API-compatible provider (e.g. DeepSeek) to serve Responses API clients.
+A proxy that converts **OpenAI Responses API** to **Chat Completions API** and back. Supports both HTTP SSE and WebSocket streaming, reasoning/thinking content, and tool calling. Works as a drop-in **Codex CLI** backend via DeepSeek or any Chat API-compatible provider.
+
+### Features
+
+- **HTTP SSE & WebSocket** — both `POST /v1/responses` (SSE) and `GET /v1/responses` (WebSocket upgrade)
+- **Reasoning / Thinking** — maps `reasoning.effort` to DeepSeek thinking mode, streams `reasoning_text.delta` events
+- **Tool Calling** — full `function_call` / `function_call_output` roundtrip with correct message ordering
+- **Codex CLI Compatible** — handles warmup, `previous_response_id` continuation, and full streaming event chain
+- **Multi-Model** — configurable per-model downstream providers
+
+### Codex CLI
+
+```bash
+# In codex config, point to this proxy:
+export OPENAI_BASE_URL="http://localhost:3000/v1"
+export OPENAI_API_KEY="sk-your-key"
+
+codex        # uses gpt-5.5 model
+codex review # uses codex-auto-review model (if configured)
+```
 
 ### How It Works
 
 ```
-Client (Responses API)  →  POST /v1/responses  →  Convert  →  POST /chat/completions  →  Provider (Chat API)
-                                                  ↑                                  ↓
-                                                  └──── Convert response back ───────┘
+Client (Responses API)  →  POST /v1/responses or WS  →  Convert  →  POST /chat/completions  →  Provider
+                              ↑                                                              ↓
+                              └──────────────── Convert response back ────────────────────────┘
 ```
 
 ### Quick Start

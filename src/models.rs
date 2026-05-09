@@ -65,6 +65,8 @@ pub enum InputItem {
     FunctionCall(FunctionCallItem),
     #[serde(rename = "function_call_output")]
     FunctionCallOutput(FunctionCallOutputItem),
+    #[serde(rename = "reasoning")]
+    Reasoning(InputReasoning),
     // Catch-all for other item types we don't explicitly handle
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -138,6 +140,15 @@ pub enum FunctionCallOutputValue {
     Array(Vec<serde_json::Value>),
 }
 
+/// A reasoning input item: `{"type": "reasoning", "id": "...", "summary": [...]}`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InputReasoning {
+    pub id: String,
+    #[serde(default)]
+    pub summary: Vec<serde_json::Value>,
+}
+
 /// Tool definition in Responses API format (flattened).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +199,16 @@ pub enum OutputItem {
     Message(OutputMessage),
     #[serde(rename = "function_call")]
     FunctionCall(OutputFunctionCall),
+    #[serde(rename = "reasoning")]
+    Reasoning(OutputReasoning),
+}
+
+/// A reasoning output item (DeepSeek thinking mode).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OutputReasoning {
+    pub id: String,
+    pub summary: Vec<serde_json::Value>,
 }
 
 /// A message output item.
@@ -267,9 +288,15 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Stop>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
 }
@@ -290,6 +317,8 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ChatToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +401,8 @@ pub struct ChatResponseMessage {
     pub role: Option<String>,
     pub content: Option<String>,
     #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
     pub tool_calls: Option<Vec<ChatToolCall>>,
 }
 
@@ -385,6 +416,10 @@ pub struct ChatUsage {
     pub completion_tokens_details: Option<serde_json::Value>,
     #[serde(default)]
     pub prompt_tokens_details: Option<serde_json::Value>,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

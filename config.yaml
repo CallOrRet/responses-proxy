@@ -14,12 +14,14 @@ server:
     - function
 
 models:
-  - model: deepseek-v4-pro
+  - model: gpt-5.5
     provider:
       base_url: https://api.deepseek.com
       api_key: sk-8ce7093c67e54899996dc6885282ddff
+    downstream_model: deepseek-v4-pro
 
-  - model: deepseek-v4-flash
+  - model: codex-auto-review
     provider:
       base_url: https://api.deepseek.com
       api_key: sk-8ce7093c67e54899996dc6885282ddff
+    downstream_model: deepseek-v4-flash

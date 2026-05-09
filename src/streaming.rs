@@ -13,10 +13,17 @@ pub struct StreamState {
     pub msg_id: String,
     pub model: String,
     pub accumulated_text: String,
+    /// Accumulated reasoning/thinking content from delta.reasoning_content.
+    pub reasoning_content: String,
     /// Accumulated tool calls keyed by index.
     pub tool_calls: Vec<ToolCallAccumulator>,
     pub has_started: bool,
     pub created: u64,
+    /// Whether we've emitted output_item.added for the message.
+    pub message_item_added: bool,
+    /// Whether we've emitted output_item.added for reasoning.
+    pub reasoning_item_added: bool,
+    pub reasoning_id: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -25,14 +32,19 @@ pub struct ToolCallAccumulator {
     pub name: String,
     pub arguments: String,
     pub index: u32,
+    /// Whether we've emitted output_item.added for this tool call.
+    pub item_added: bool,
+    /// Generated output item ID.
+    pub fc_id: String,
 }
 
 impl StreamState {
     pub fn new(response_id: String, msg_id: String, model: String) -> Self {
         Self {
-            response_id,
+            response_id: response_id.clone(),
             msg_id,
             model,
+            reasoning_id: format!("rs_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
             ..Default::default()
         }
     }
@@ -42,7 +54,16 @@ impl StreamState {
 #[derive(Debug)]
 pub enum StreamEvent {
     Created(Value),
-    TextDelta(Value),
+    OutputItemAdded(Value),
+    ContentPartAdded(Value),
+    OutputTextDelta(Value),
+    ReasoningTextDelta(Value),
+    OutputTextDone(Value),
+    ReasoningTextDone(Value),
+    FunctionCallArgumentsDelta(Value),
+    OutputItemDone(Value),
+    ContentPartDone(Value),
+    FunctionCallArgumentsDone(Value),
     Completed(Value),
     Failed(Value),
 }
@@ -51,7 +72,16 @@ impl StreamEvent {
     pub fn to_sse_json(&self) -> Value {
         match self {
             StreamEvent::Created(v)
-            | StreamEvent::TextDelta(v)
+            | StreamEvent::OutputItemAdded(v)
+            | StreamEvent::ContentPartAdded(v)
+            | StreamEvent::OutputTextDelta(v)
+            | StreamEvent::ReasoningTextDelta(v)
+            | StreamEvent::OutputTextDone(v)
+            | StreamEvent::ReasoningTextDone(v)
+            | StreamEvent::FunctionCallArgumentsDelta(v)
+            | StreamEvent::OutputItemDone(v)
+            | StreamEvent::ContentPartDone(v)
+            | StreamEvent::FunctionCallArgumentsDone(v)
             | StreamEvent::Completed(v)
             | StreamEvent::Failed(v) => v.clone(),
         }
@@ -60,7 +90,16 @@ impl StreamEvent {
     pub fn event_type(&self) -> &str {
         match self {
             StreamEvent::Created(_) => "response.created",
-            StreamEvent::TextDelta(_) => "response.output_text.delta",
+            StreamEvent::OutputItemAdded(_) => "response.output_item.added",
+            StreamEvent::ContentPartAdded(_) => "response.content_part.added",
+            StreamEvent::OutputTextDelta(_) => "response.output_text.delta",
+            StreamEvent::ReasoningTextDelta(_) => "response.reasoning_text.delta",
+            StreamEvent::OutputTextDone(_) => "response.output_text.done",
+            StreamEvent::ReasoningTextDone(_) => "response.reasoning_text.done",
+            StreamEvent::FunctionCallArgumentsDelta(_) => "response.function_call_arguments.delta",
+            StreamEvent::OutputItemDone(_) => "response.output_item.done",
+            StreamEvent::ContentPartDone(_) => "response.content_part.done",
+            StreamEvent::FunctionCallArgumentsDone(_) => "response.function_call_arguments.done",
             StreamEvent::Completed(_) => "response.completed",
             StreamEvent::Failed(_) => "response.failed",
         }
@@ -72,7 +111,7 @@ impl StreamEvent {
 /// Returns `None` if the SSE data is not relevant (e.g., role-only delta, empty chunk).
 pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEvent>> {
     if data == "[DONE]" {
-        return Some(vec![build_completed_event(state)]);
+        return Some(build_completion_events(state));
     }
 
     let chunk: Value = match serde_json::from_str(data) {
@@ -96,13 +135,78 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                 None => continue,
             };
 
+            // Reasoning content delta (DeepSeek thinking mode CoT)
+            if let Some(reasoning) = delta["reasoning_content"].as_str()
+                && !reasoning.is_empty()
+            {
+                has_content = true;
+                if !state.reasoning_item_added {
+                    events.push(StreamEvent::OutputItemAdded(json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": state.reasoning_id,
+                            "status": "in_progress",
+                            "summary": []
+                        }
+                    })));
+                    events.push(StreamEvent::ContentPartAdded(json!({
+                        "type": "response.content_part.added",
+                        "item_id": state.reasoning_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "reasoning_text",
+                            "text": ""
+                        }
+                    })));
+                    state.reasoning_item_added = true;
+                }
+                state.reasoning_content.push_str(reasoning);
+                events.push(StreamEvent::ReasoningTextDelta(json!({
+                    "type": "response.reasoning_text.delta",
+                    "item_id": state.reasoning_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": reasoning
+                })));
+            }
+
             // Text content delta
             if let Some(content) = delta["content"].as_str()
                 && !content.is_empty()
             {
                 has_content = true;
+                // Emit item/part added before first text delta
+                if !state.message_item_added {
+                    let output_index = if state.reasoning_item_added { 1 } else { 0 };
+                    events.push(StreamEvent::OutputItemAdded(json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "message",
+                            "id": state.msg_id,
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": []
+                        }
+                    })));
+                    events.push(StreamEvent::ContentPartAdded(json!({
+                        "type": "response.content_part.added",
+                        "item_id": state.msg_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": []
+                        }
+                    })));
+                    state.message_item_added = true;
+                }
                 state.accumulated_text.push_str(content);
-                events.push(StreamEvent::TextDelta(json!({
+                events.push(StreamEvent::OutputTextDelta(json!({
                     "type": "response.output_text.delta",
                     "item_id": state.msg_id,
                     "output_index": 0,
@@ -127,12 +231,48 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                     if let Some(id) = tc["id"].as_str() {
                         acc.id = id.to_string();
                     }
+
+                    // Generate fc_id on first encounter
+                    if acc.fc_id.is_empty() {
+                        acc.fc_id =
+                            format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+                    }
+
+                    // Emit output_item.added on first encounter
+                    if !acc.item_added && !acc.id.is_empty() {
+                        let output_index =
+                            (if state.reasoning_item_added { 1 } else { 0 }) + index as usize;
+                        events.push(StreamEvent::OutputItemAdded(json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "type": "function_call",
+                                "id": acc.fc_id,
+                                "call_id": acc.id,
+                                "name": "",
+                                "arguments": "",
+                                "status": "in_progress"
+                            }
+                        })));
+                        acc.item_added = true;
+                    }
+
                     if let Some(func) = tc.get("function") {
                         if let Some(name) = func["name"].as_str() {
                             acc.name.push_str(name);
                         }
                         if let Some(args) = func["arguments"].as_str() {
                             acc.arguments.push_str(args);
+                            if acc.item_added {
+                                let output_index = (if state.reasoning_item_added { 1 } else { 0 })
+                                    + index as usize;
+                                events.push(StreamEvent::FunctionCallArgumentsDelta(json!({
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": acc.fc_id,
+                                    "output_index": output_index,
+                                    "delta": args
+                                })));
+                            }
                         }
                     }
                 }
@@ -149,6 +289,7 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                 "response": {
                     "id": state.response_id,
                     "object": "response",
+                    "created_at": state.created,
                     "model": state.model,
                     "status": "in_progress",
                     "output": []
@@ -165,32 +306,150 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
     }
 }
 
-fn build_completed_event(state: &StreamState) -> StreamEvent {
+/// Build the final events when the stream ends:
+/// content_part.done + output_item.done for each item, then response.completed.
+fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
     let mut output_items: Vec<Value> = Vec::new();
 
-    // Build the message output item
-    let mut content_blocks: Vec<Value> = Vec::new();
-    if !state.accumulated_text.is_empty() {
-        content_blocks.push(json!({
-            "type": "output_text",
-            "text": state.accumulated_text,
-            "annotations": []
+    // Close reasoning item if we started one
+    if state.reasoning_item_added {
+        events.push(StreamEvent::ReasoningTextDone(json!({
+            "type": "response.reasoning_text.done",
+            "item_id": state.reasoning_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": state.reasoning_content
+        })));
+        events.push(StreamEvent::ContentPartDone(json!({
+            "type": "response.content_part.done",
+            "item_id": state.reasoning_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "reasoning_text",
+                "text": state.reasoning_content
+            }
+        })));
+        events.push(StreamEvent::OutputItemDone(json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": state.reasoning_id,
+                "status": "completed",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": state.reasoning_content
+                }]
+            }
+        })));
+
+        output_items.push(json!({
+            "type": "reasoning",
+            "id": state.reasoning_id,
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": state.reasoning_content
+            }]
         }));
     }
-    if !content_blocks.is_empty() || state.tool_calls.is_empty() {
+
+    // Close message item if we started one, or if there was no text but also no tool calls
+    if state.message_item_added {
+        let output_index = if state.reasoning_item_added { 1 } else { 0 };
+        events.push(StreamEvent::OutputTextDone(json!({
+            "type": "response.output_text.done",
+            "item_id": state.msg_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": state.accumulated_text
+        })));
+        events.push(StreamEvent::ContentPartDone(json!({
+            "type": "response.content_part.done",
+            "item_id": state.msg_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": state.accumulated_text,
+                "annotations": []
+            }
+        })));
+        events.push(StreamEvent::OutputItemDone(json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": state.msg_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": state.accumulated_text,
+                    "annotations": []
+                }]
+            }
+        })));
+
         output_items.push(json!({
             "type": "message",
             "id": state.msg_id,
             "role": "assistant",
             "status": "completed",
-            "content": content_blocks
+            "content": [{
+                "type": "output_text",
+                "text": state.accumulated_text,
+                "annotations": []
+            }]
+        }));
+    } else if !state.accumulated_text.is_empty() || state.tool_calls.is_empty() {
+        // No streaming deltas were emitted (e.g. very short response), but we still need the message
+        output_items.push(json!({
+            "type": "message",
+            "id": state.msg_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": state.accumulated_text,
+                "annotations": []
+            }]
         }));
     }
 
     // Add function call items for accumulated tool calls
     for tc in &state.tool_calls {
         if !tc.id.is_empty() {
-            let fc_id = format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+            let fc_id = if tc.fc_id.is_empty() {
+                format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
+            } else {
+                tc.fc_id.clone()
+            };
+            let output_index = (if state.reasoning_item_added { 1 } else { 0 }) + tc.index as usize;
+            // If we streamed this tool call, emit done events
+            if tc.item_added {
+                events.push(StreamEvent::FunctionCallArgumentsDone(json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": fc_id,
+                    "output_index": output_index,
+                    "arguments": tc.arguments,
+                    "name": tc.name
+                })));
+                events.push(StreamEvent::OutputItemDone(json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                        "status": "completed"
+                    }
+                })));
+            }
             output_items.push(json!({
                 "type": "function_call",
                 "id": fc_id,
@@ -202,7 +461,7 @@ fn build_completed_event(state: &StreamState) -> StreamEvent {
         }
     }
 
-    StreamEvent::Completed(json!({
+    events.push(StreamEvent::Completed(json!({
         "type": "response.completed",
         "response": {
             "id": state.response_id,
@@ -211,7 +470,9 @@ fn build_completed_event(state: &StreamState) -> StreamEvent {
             "status": "completed",
             "output": output_items
         }
-    }))
+    })));
+
+    events
 }
 
 #[cfg(test)]
@@ -226,6 +487,14 @@ mod tests {
         )
     }
 
+    /// Find the Completed event in a vec of events from [DONE] processing.
+    fn find_completed(events: &[StreamEvent]) -> &StreamEvent {
+        events
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Completed(_)))
+            .expect("Expected a Completed event")
+    }
+
     #[test]
     fn test_single_text_chunk() {
         let mut state = make_state();
@@ -236,7 +505,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+                .any(|e| matches!(e, StreamEvent::OutputTextDelta(_)))
         );
         assert_eq!(state.accumulated_text, "Hello");
     }
@@ -276,8 +545,7 @@ mod tests {
         state.accumulated_text = "Full response".into();
 
         let events = process_chunk(&mut state, "[DONE]").unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        match find_completed(&events) {
             StreamEvent::Completed(v) => {
                 assert_eq!(v["type"], "response.completed");
                 let output = v["response"]["output"].as_array().unwrap();
@@ -312,7 +580,7 @@ mod tests {
 
         // Done
         let events = process_chunk(&mut state, "[DONE]").unwrap();
-        match &events[0] {
+        match find_completed(&events) {
             StreamEvent::Completed(v) => {
                 let output = v["response"]["output"].as_array().unwrap();
                 // Should have a function_call item
@@ -349,7 +617,7 @@ mod tests {
         assert_eq!(state.tool_calls[1].name, "get_time");
 
         let events = process_chunk(&mut state, "[DONE]").unwrap();
-        match &events[0] {
+        match find_completed(&events) {
             StreamEvent::Completed(v) => {
                 let output = v["response"]["output"].as_array().unwrap();
                 let fc_names: Vec<&str> = output
@@ -377,7 +645,7 @@ mod tests {
         assert_eq!(state.tool_calls[0].name, "search");
 
         let events = process_chunk(&mut state, "[DONE]").unwrap();
-        match &events[0] {
+        match find_completed(&events) {
             StreamEvent::Completed(v) => {
                 let output = v["response"]["output"].as_array().unwrap();
                 let msg = output.iter().find(|o| o["type"] == "message").unwrap();
@@ -471,7 +739,7 @@ data: [DONE]
         assert!(
             final_events
                 .iter()
-                .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+                .any(|e| matches!(e, StreamEvent::OutputTextDelta(_)))
         );
         assert!(
             final_events
@@ -509,9 +777,65 @@ data: [DONE]
         assert_eq!(state.accumulated_text, "End");
 
         let events = process_chunk(&mut state, "[DONE]").unwrap();
-        match &events[0] {
+        match find_completed(&events) {
             StreamEvent::Completed(v) => {
                 assert_eq!(v["response"]["status"], "completed");
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reasoning_content_accumulates_and_appears_in_completed() {
+        let mut state = make_state();
+
+        // Simulate thinking mode streaming: reasoning_content comes before content
+        process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"reasoning_content":"Let me"}}]}"#,
+        );
+        process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"reasoning_content":" think about this."}}]}"#,
+        );
+        process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"content":"The answer is 42."}}]}"#,
+        );
+
+        assert_eq!(state.reasoning_content, "Let me think about this.");
+        assert_eq!(state.accumulated_text, "The answer is 42.");
+
+        let events = process_chunk(&mut state, "[DONE]").unwrap();
+        match find_completed(&events) {
+            StreamEvent::Completed(v) => {
+                let output = v["response"]["output"].as_array().unwrap();
+                // First output item should be reasoning
+                let reasoning = output.iter().find(|o| o["type"] == "reasoning").unwrap();
+                assert_eq!(reasoning["summary"][0]["type"], "summary_text");
+                assert_eq!(reasoning["summary"][0]["text"], "Let me think about this.");
+                // Second output item should be the message
+                let msg = output.iter().find(|o| o["type"] == "message").unwrap();
+                assert_eq!(msg["content"][0]["text"], "The answer is 42.");
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_reasoning_when_not_present() {
+        let mut state = make_state();
+        state.accumulated_text = "Plain answer without thinking.".into();
+
+        let events = process_chunk(&mut state, "[DONE]").unwrap();
+        match find_completed(&events) {
+            StreamEvent::Completed(v) => {
+                let output = v["response"]["output"].as_array().unwrap();
+                // Should NOT have a reasoning item
+                assert!(
+                    !output.iter().any(|o| o["type"] == "reasoning"),
+                    "No reasoning item when reasoning_content is empty"
+                );
             }
             other => panic!("Expected Completed, got {:?}", other),
         }

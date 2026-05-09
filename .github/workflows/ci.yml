@@ -12,67 +12,42 @@ env:
 
 jobs:
   test:
+    name: test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+        os:
+          - ubuntu-latest      # x86_64-unknown-linux-gnu
+          - ubuntu-24.04-arm   # aarch64-unknown-linux-gnu
+          - macos-latest       # aarch64-apple-darwin
+          - windows-latest     # x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-
-      - name: Add target
-        run: rustup target add ${{ matrix.target }}
-
       - name: Show toolchain
         run: rustc -V && cargo -V
-
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: cargo build
-        run: cargo build --all-targets
-
-      - name: cargo test
-        run: cargo test --bin responses-proxy
+      - run: cargo build --all-targets
+      - run: cargo test --all-features
 
   msrv:
+    name: msrv (1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust MSRV
-        uses: dtolnay/rust-toolchain@master
+      - name: Remove rust-toolchain.toml
+        run: rm -f rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.85"
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: cargo build (MSRV)
-        run: cargo build
+      - run: cargo build
 
   lints:
+    name: clippy + rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features

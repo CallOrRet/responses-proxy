@@ -29,7 +29,7 @@ jobs:
           fi
 
       - name: cargo test
-        run: cargo test --bin responses-proxy
+        run: cargo test --all-features
 
       - name: cargo publish
         env:

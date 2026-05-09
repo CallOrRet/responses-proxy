@@ -69,7 +69,7 @@ fn default_request_timeout() -> u64 {
 }
 
 /// Resolved provider config with API key resolved from env if needed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedProvider {
     pub base_url: String,
     pub api_key: String,

@@ -12,6 +12,19 @@ pub fn chat_to_responses(
 
     // Extract the top choice (Responses API typically returns a single output).
     if let Some(choice) = chat_resp.choices.first() {
+        // If the model returned reasoning content, emit a reasoning item.
+        if let Some(ref rc) = choice.message.reasoning_content
+            && !rc.is_empty()
+        {
+            output_items.push(OutputItem::Reasoning(OutputReasoning {
+                id: format!("rs_{}", Uuid::new_v4().to_string().replace('-', "")),
+                summary: vec![serde_json::json!({
+                    "type": "summary_text",
+                    "text": rc
+                })],
+            }));
+        }
+
         // Build the assistant message output item.
         let mut content_blocks: Vec<OutputContentBlock> = Vec::new();
 
@@ -43,6 +56,7 @@ pub fn chat_to_responses(
             Some("tool_calls") => "completed",
             Some("length") => "completed",
             Some("content_filter") => "incomplete",
+            Some("insufficient_system_resource") => "incomplete",
             _ => "completed",
         };
 
@@ -52,6 +66,9 @@ pub fn chat_to_responses(
             })),
             Some("length") => Some(serde_json::json!({
                 "reason": "max_output_tokens"
+            })),
+            Some("insufficient_system_resource") => Some(serde_json::json!({
+                "reason": "server_error"
             })),
             _ => None,
         };
@@ -102,18 +119,9 @@ pub fn chat_to_responses(
         let cached_tokens = u
             .prompt_tokens_details
             .as_ref()
-            .map(|d| {
-                let hit = d
-                    .get("prompt_cache_hit_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let miss = d
-                    .get("prompt_cache_miss_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                (hit + miss) as u32
-            })
-            .unwrap_or(0);
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         ResponseUsage {
             input_tokens: u.prompt_tokens,
@@ -124,7 +132,7 @@ pub fn chat_to_responses(
         }
     });
 
-    ResponsesResponse {
+    let response = ResponsesResponse {
         id: if chat_resp.id.starts_with("resp_") {
             chat_resp.id
         } else {
@@ -142,7 +150,15 @@ pub fn chat_to_responses(
         usage,
         incomplete_details,
         error,
-    }
+    };
+
+    tracing::debug!(
+        "Converted response: {} output items, status={}",
+        response.output.len(),
+        response.status,
+    );
+
+    response
 }
 
 #[cfg(test)]
@@ -161,6 +177,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Hello! How can I help you?".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -171,6 +188,8 @@ mod tests {
                 total_tokens: 15,
                 completion_tokens_details: None,
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
             error: None,
         };
@@ -217,6 +236,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Let me check the weather.".into()),
+                    reasoning_content: None,
                     tool_calls: Some(vec![ChatToolCall {
                         id: "call_abc".into(),
                         call_type: "function".into(),
@@ -234,6 +254,8 @@ mod tests {
                 total_tokens: 30,
                 completion_tokens_details: None,
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
             error: None,
         };
@@ -276,6 +298,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Hi".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -286,6 +309,8 @@ mod tests {
                 total_tokens: 150,
                 completion_tokens_details: Some(serde_json::json!({"reasoning_tokens": 20})),
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
             error: None,
         };
@@ -313,6 +338,7 @@ mod tests {
                     message: ChatResponseMessage {
                         role: Some("assistant".into()),
                         content: Some("First choice".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".into()),
@@ -322,6 +348,7 @@ mod tests {
                     message: ChatResponseMessage {
                         role: Some("assistant".into()),
                         content: Some("Second choice".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".into()),
@@ -357,6 +384,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Truncated...".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("length".into()),
@@ -381,6 +409,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("content_filter".into()),
@@ -431,6 +460,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Answer".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -441,6 +471,8 @@ mod tests {
                 total_tokens: 150,
                 completion_tokens_details: Some(serde_json::json!({"reasoning_tokens": 80})),
                 prompt_tokens_details: None,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
             error: None,
         };
@@ -463,6 +495,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("Hi".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -505,6 +538,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ChatToolCall {
                         id: "call_xyz".into(),
                         call_type: "function".into(),
@@ -542,6 +576,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("content_filter".into()),
@@ -577,6 +612,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("truncated...".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("length".into()),
@@ -602,6 +638,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("filtered...".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("content_filter".into()),
@@ -627,6 +664,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("done".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -651,6 +689,7 @@ mod tests {
                 message: ChatResponseMessage {
                     role: Some("assistant".into()),
                     content: Some("cached response".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
@@ -661,17 +700,51 @@ mod tests {
                 total_tokens: 130,
                 completion_tokens_details: None,
                 prompt_tokens_details: Some(serde_json::json!({
-                    "prompt_cache_hit_tokens": 80,
-                    "prompt_cache_miss_tokens": 20
+                    "cached_tokens": 100
                 })),
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
             error: None,
         };
 
         let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let usage = resp.usage.unwrap();
-        assert_eq!(usage.input_tokens_details.cached_tokens, 100); // 80 + 20
+        assert_eq!(usage.input_tokens_details.cached_tokens, 100);
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn test_insufficient_system_resource() {
+        let chat = ChatCompletionResponse {
+            id: "chatcmpl-isr".into(),
+            object: "chat.completion".into(),
+            created: 1715550000,
+            model: "deepseek-v4-pro".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: Some("assistant".into()),
+                    content: Some("Partial...".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("insufficient_system_resource".into()),
+            }],
+            usage: None,
+            error: None,
+        };
+
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
+        // Status should be "incomplete" not "completed"
+        match &resp.output[0] {
+            OutputItem::Message(msg) => {
+                assert_eq!(msg.status, "incomplete");
+            }
+            _ => panic!("Expected message"),
+        }
+        let details = resp.incomplete_details.unwrap();
+        assert_eq!(details["reason"], "server_error");
     }
 }
