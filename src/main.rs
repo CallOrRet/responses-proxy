@@ -528,10 +528,12 @@ async fn handle_responses(
     // Auth check
     check_auth(&state.config, &headers)?;
 
-    tracing::debug!(
-        "Received request: {}",
-        String::from_utf8_lossy(&body).trim()
-    );
+    let body_preview = String::from_utf8_lossy(&body[..body.len().min(200)]);
+    if body_preview.starts_with('{') || body_preview.starts_with('[') {
+        tracing::debug!("Received request: {}", body_preview.trim());
+    } else {
+        tracing::debug!("Received request: {} bytes (non-JSON)", body.len());
+    }
 
     let responses_req: ResponsesRequest = serde_json::from_slice(&body).map_err(|e| {
         (

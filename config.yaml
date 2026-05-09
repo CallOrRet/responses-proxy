@@ -16,12 +16,12 @@ server:
 models:
   - model: gpt-5.5
     provider:
+      api_key: $DEEPSEEK_API_KEY
       base_url: https://api.deepseek.com
-      api_key: sk-8ce7093c67e54899996dc6885282ddff
     downstream_model: deepseek-v4-pro
 
   - model: codex-auto-review
     provider:
+      api_key: $DEEPSEEK_API_KEY
       base_url: https://api.deepseek.com
-      api_key: sk-8ce7093c67e54899996dc6885282ddff
     downstream_model: deepseek-v4-flash

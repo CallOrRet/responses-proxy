@@ -21,6 +21,8 @@ pub struct StreamState {
     pub created: u64,
     /// Whether we've emitted output_item.added for the message.
     pub message_item_added: bool,
+    /// The output_index of the message item (set when output_item.added is emitted).
+    pub msg_output_index: usize,
     /// Whether we've emitted output_item.added for reasoning.
     pub reasoning_item_added: bool,
     pub reasoning_id: String,
@@ -127,9 +129,11 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
     let mut events = Vec::new();
     let mut has_content = false;
 
-    // Process choices
+    // Process choices. Each choice has its own index (relevant when n > 1).
+    // For DeepSeek (n=1), choice.index is always 0.
     if let Some(choices) = chunk["choices"].as_array() {
         for choice in choices {
+            let _choice_index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
             let delta = match choice.get("delta") {
                 Some(d) => d,
                 None => continue,
@@ -148,7 +152,8 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                             "type": "reasoning",
                             "id": state.reasoning_id,
                             "status": "in_progress",
-                            "summary": []
+                            "summary": [],
+                            "content": []
                         }
                     })));
                     events.push(StreamEvent::ContentPartAdded(json!({
@@ -178,9 +183,9 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                 && !content.is_empty()
             {
                 has_content = true;
-                // Emit item/part added before first text delta
                 if !state.message_item_added {
                     let output_index = if state.reasoning_item_added { 1 } else { 0 };
+                    state.msg_output_index = output_index;
                     events.push(StreamEvent::OutputItemAdded(json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
@@ -209,7 +214,7 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                 events.push(StreamEvent::OutputTextDelta(json!({
                     "type": "response.output_text.delta",
                     "item_id": state.msg_id,
-                    "output_index": 0,
+                    "output_index": state.msg_output_index,
                     "content_index": 0,
                     "delta": content
                 })));
@@ -338,8 +343,9 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
                 "type": "reasoning",
                 "id": state.reasoning_id,
                 "status": "completed",
-                "summary": [{
-                    "type": "summary_text",
+                "summary": [],
+                "content": [{
+                    "type": "reasoning_text",
                     "text": state.reasoning_content
                 }]
             }
@@ -349,16 +355,63 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
             "type": "reasoning",
             "id": state.reasoning_id,
             "status": "completed",
-            "summary": [{
-                "type": "summary_text",
+            "summary": [],
+            "content": [{
+                "type": "reasoning_text",
                 "text": state.reasoning_content
             }]
         }));
     }
 
-    // Close message item if we started one, or if there was no text but also no tool calls
+    // Close function call items (before message, matching output_index order)
+    for tc in &state.tool_calls {
+        if !tc.id.is_empty() {
+            let fc_id = if tc.fc_id.is_empty() {
+                format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
+            } else {
+                tc.fc_id.clone()
+            };
+            let output_index = (if state.reasoning_item_added { 1 } else { 0 }) + tc.index as usize;
+            if tc.item_added {
+                events.push(StreamEvent::FunctionCallArgumentsDone(json!({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": fc_id,
+                    "output_index": output_index,
+                    "arguments": tc.arguments,
+                    "name": tc.name
+                })));
+                events.push(StreamEvent::OutputItemDone(json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": fc_id,
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                        "status": "completed"
+                    }
+                })));
+            }
+            output_items.push(json!({
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "status": "completed"
+            }));
+        }
+    }
+
+    // Close message item last (highest output_index)
     if state.message_item_added {
-        let output_index = if state.reasoning_item_added { 1 } else { 0 };
+        let output_index = state.msg_output_index
+            + state
+                .tool_calls
+                .iter()
+                .filter(|tc| !tc.id.is_empty())
+                .count();
         events.push(StreamEvent::OutputTextDone(json!({
             "type": "response.output_text.done",
             "item_id": state.msg_id,
@@ -405,7 +458,6 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
             }]
         }));
     } else if !state.accumulated_text.is_empty() || state.tool_calls.is_empty() {
-        // No streaming deltas were emitted (e.g. very short response), but we still need the message
         output_items.push(json!({
             "type": "message",
             "id": state.msg_id,
@@ -417,48 +469,6 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
                 "annotations": []
             }]
         }));
-    }
-
-    // Add function call items for accumulated tool calls
-    for tc in &state.tool_calls {
-        if !tc.id.is_empty() {
-            let fc_id = if tc.fc_id.is_empty() {
-                format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
-            } else {
-                tc.fc_id.clone()
-            };
-            let output_index = (if state.reasoning_item_added { 1 } else { 0 }) + tc.index as usize;
-            // If we streamed this tool call, emit done events
-            if tc.item_added {
-                events.push(StreamEvent::FunctionCallArgumentsDone(json!({
-                    "type": "response.function_call_arguments.done",
-                    "item_id": fc_id,
-                    "output_index": output_index,
-                    "arguments": tc.arguments,
-                    "name": tc.name
-                })));
-                events.push(StreamEvent::OutputItemDone(json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": fc_id,
-                        "call_id": tc.id,
-                        "name": tc.name,
-                        "arguments": tc.arguments,
-                        "status": "completed"
-                    }
-                })));
-            }
-            output_items.push(json!({
-                "type": "function_call",
-                "id": fc_id,
-                "call_id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-                "status": "completed"
-            }));
-        }
     }
 
     events.push(StreamEvent::Completed(json!({
@@ -812,8 +822,8 @@ data: [DONE]
                 let output = v["response"]["output"].as_array().unwrap();
                 // First output item should be reasoning
                 let reasoning = output.iter().find(|o| o["type"] == "reasoning").unwrap();
-                assert_eq!(reasoning["summary"][0]["type"], "summary_text");
-                assert_eq!(reasoning["summary"][0]["text"], "Let me think about this.");
+                assert_eq!(reasoning["content"][0]["type"], "reasoning_text");
+                assert_eq!(reasoning["content"][0]["text"], "Let me think about this.");
                 // Second output item should be the message
                 let msg = output.iter().find(|o| o["type"] == "message").unwrap();
                 assert_eq!(msg["content"][0]["text"], "The answer is 42.");
