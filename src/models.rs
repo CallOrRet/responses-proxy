@@ -210,9 +210,7 @@ pub enum OutputContentBlock {
         annotations: Vec<serde_json::Value>,
     },
     #[serde(rename = "refusal")]
-    Refusal {
-        refusal: String,
-    },
+    Refusal { refusal: String },
 }
 
 /// A function call output item.

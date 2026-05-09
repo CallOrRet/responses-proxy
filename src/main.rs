@@ -1,19 +1,21 @@
+mod config;
 mod convert_request;
 mod convert_response;
 mod models;
 mod streaming;
 
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event as SseEvent, KeepAlive},
         IntoResponse, Response, Sse,
+        sse::{Event as SseEvent, KeepAlive},
     },
     routing::{get, post},
-    Json, Router,
 };
+use config::ResolvedConfig;
 use convert_request::responses_to_chat;
 use convert_response::chat_to_responses;
 use futures::StreamExt;
@@ -26,8 +28,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 struct AppState {
     http_client: reqwest::Client,
-    downstream_url: String,
-    api_key: String,
+    config: ResolvedConfig,
 }
 
 #[tokio::main]
@@ -39,24 +40,21 @@ async fn main() {
         )
         .init();
 
-    let downstream_url = std::env::var("DOWNSTREAM_URL")
-        .unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let api_key = std::env::var("DOWNSTREAM_API_KEY")
-        .expect("DOWNSTREAM_API_KEY environment variable must be set");
-    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
-    let request_timeout = std::env::var("REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(120));
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".into());
+    let resolved = config::load_config(&config_path).expect("Failed to load config");
+
+    tracing::info!(
+        "Loaded {} models from {}",
+        resolved.model_names.len(),
+        config_path
+    );
 
     let state = Arc::new(AppState {
         http_client: reqwest::Client::builder()
-            .timeout(request_timeout)
+            .timeout(Duration::from_secs(resolved.request_timeout_secs))
             .build()
             .expect("Failed to build HTTP client"),
-        downstream_url,
-        api_key,
+        config: resolved,
     });
 
     let cors = CorsLayer::new()
@@ -64,8 +62,10 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let listen_addr = state.config.listen_addr.clone();
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/v1/models", get(list_models))
         .route("/v1/responses", post(handle_responses))
         .layer(cors)
         .with_state(state);
@@ -80,11 +80,70 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+fn check_auth(
+    config: &ResolvedConfig,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !config.auth_enabled {
+        return Ok(());
+    }
+
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match auth_header {
+        Some(key) if config.auth_keys.iter().any(|k| k == key) => Ok(()),
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "authentication_error",
+                    "message": "Invalid or missing API key",
+                }
+            })),
+        )),
+    }
+}
+
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(e) = check_auth(&state.config, &headers) {
+        return Err(e);
+    }
+    let data: Vec<serde_json::Value> = state
+        .config
+        .model_names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "responses-proxy"
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "object": "list",
+        "data": data
+    })))
+}
+
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // Auth check
+    if let Err(e) = check_auth(&state.config, &headers) {
+        return Err(e);
+    }
+
     let responses_req: ResponsesRequest = serde_json::from_slice(&body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -98,35 +157,69 @@ async fn handle_responses(
     })?;
 
     let original_model = responses_req.model.clone();
+
+    // Look up the model in config to get provider details.
+    let provider = state.config.models.get(&original_model).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("Unknown model: {}. Available: {:?}", original_model, state.config.model_names),
+                }
+            })),
+        )
+    })?;
+
     let is_stream = responses_req.stream.unwrap_or(false);
-    let chat_req = responses_to_chat(responses_req);
-    let model_name = chat_req.model.clone();
+    let mut chat_req = responses_to_chat(responses_req, &state.config.tool_type_allowlist);
+
+    // Override the model name with the downstream model.
+    chat_req.model = provider.downstream_model.clone();
 
     tracing::info!(
-        model = %model_name,
+        model = %original_model,
+        downstream = %provider.downstream_model,
         messages = chat_req.messages.len(),
         stream = is_stream,
         "Forwarding request"
     );
 
     if is_stream {
-        handle_streaming(state, chat_req, original_model).await.map(|sse| sse.into_response())
+        handle_streaming(
+            &state.http_client,
+            &provider.base_url,
+            &provider.api_key,
+            chat_req,
+            original_model,
+        )
+        .await
+        .map(|sse| sse.into_response())
     } else {
-        handle_non_streaming(state, chat_req, original_model).await.map(|json| json.into_response())
+        handle_non_streaming(
+            &state.http_client,
+            &provider.base_url,
+            &provider.api_key,
+            chat_req,
+            original_model,
+        )
+        .await
+        .map(|json| json.into_response())
     }
 }
 
 async fn handle_non_streaming(
-    state: Arc<AppState>,
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
     chat_req: ChatCompletionRequest,
     original_model: String,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let url = format!("{}/chat/completions", state.downstream_url);
+    let url = format!("{}/chat/completions", base_url);
 
-    let response = state
-        .http_client
+    let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", state.api_key))
+        .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&chat_req)
         .send()
@@ -185,16 +278,17 @@ async fn handle_non_streaming(
 }
 
 async fn handle_streaming(
-    state: Arc<AppState>,
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
     chat_req: ChatCompletionRequest,
     original_model: String,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let url = format!("{}/chat/completions", state.downstream_url);
+    let url = format!("{}/chat/completions", base_url);
 
-    let response = state
-        .http_client
+    let response = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", state.api_key))
+        .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&chat_req)
         .send()
@@ -252,20 +346,17 @@ async fn handle_streaming(
                             .find(|l| l.starts_with("data:"))
                             .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()));
 
-                        if let Some(data) = data_line {
-                            if let Some(events) =
-                                streaming::process_chunk(&mut stream_state, data)
+                        if let Some(data) = data_line
+                            && let Some(events) = streaming::process_chunk(&mut stream_state, data)
                             {
                                 for event in events {
-                                    let sse_event = SseEvent::default()
-                                        .json_data(event.to_sse_json())
-                                        .unwrap();
+                                    let sse_event =
+                                        SseEvent::default().json_data(event.to_sse_json()).unwrap();
                                     if tx.send(Ok(sse_event)).await.is_err() {
                                         return; // client disconnected
                                     }
                                 }
                             }
-                        }
                     }
                 }
                 Err(_) => {

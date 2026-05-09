@@ -4,7 +4,7 @@
 //! Handles incremental text deltas and tool call deltas, accumulating state
 //! across chunks and emitting properly-typed Responses API streaming events.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Accumulated state across a streaming response.
 #[derive(Debug, Default)]
@@ -50,8 +50,10 @@ pub enum StreamEvent {
 impl StreamEvent {
     pub fn to_sse_json(&self) -> Value {
         match self {
-            StreamEvent::Created(v) | StreamEvent::TextDelta(v)
-            | StreamEvent::Completed(v) | StreamEvent::Failed(v) => v.clone(),
+            StreamEvent::Created(v)
+            | StreamEvent::TextDelta(v)
+            | StreamEvent::Completed(v)
+            | StreamEvent::Failed(v) => v.clone(),
         }
     }
 
@@ -95,8 +97,8 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
             };
 
             // Text content delta
-            if let Some(content) = delta["content"].as_str() {
-                if !content.is_empty() {
+            if let Some(content) = delta["content"].as_str()
+                && !content.is_empty() {
                     has_content = true;
                     state.accumulated_text.push_str(content);
                     events.push(StreamEvent::TextDelta(json!({
@@ -107,7 +109,6 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                         "delta": content
                     })));
                 }
-            }
 
             // Tool call deltas (arrive incrementally in Chat API streaming)
             if let Some(tool_calls) = delta["tool_calls"].as_array() {
@@ -140,16 +141,19 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
 
     // Emit created event on first content-bearing chunk
     if has_content && !state.has_started {
-        events.insert(0, StreamEvent::Created(json!({
-            "type": "response.created",
-            "response": {
-                "id": state.response_id,
-                "object": "response",
-                "model": state.model,
-                "status": "in_progress",
-                "output": []
-            }
-        })));
+        events.insert(
+            0,
+            StreamEvent::Created(json!({
+                "type": "response.created",
+                "response": {
+                    "id": state.response_id,
+                    "object": "response",
+                    "model": state.model,
+                    "status": "in_progress",
+                    "output": []
+                }
+            })),
+        );
         state.has_started = true;
     }
 
@@ -185,10 +189,7 @@ fn build_completed_event(state: &StreamState) -> StreamEvent {
     // Add function call items for accumulated tool calls
     for tc in &state.tool_calls {
         if !tc.id.is_empty() {
-            let fc_id = format!(
-                "fc_{}",
-                uuid::Uuid::new_v4().to_string().replace('-', "")
-            );
+            let fc_id = format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
             output_items.push(json!({
                 "type": "function_call",
                 "id": fc_id,
@@ -220,18 +221,22 @@ mod tests {
         StreamState::new(
             "resp_test".into(),
             "msg_test".into(),
-            "deepseek-chat".into(),
+            "deepseek-v4-pro".into(),
         )
     }
 
     #[test]
     fn test_single_text_chunk() {
         let mut state = make_state();
-        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let data = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
 
         let events = process_chunk(&mut state, data).unwrap();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Created(_))));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+        );
         assert_eq!(state.accumulated_text, "Hello");
     }
 
@@ -239,18 +244,12 @@ mod tests {
     fn test_multiple_text_chunks_accumulate() {
         let mut state = make_state();
 
-        process_chunk(
-            &mut state,
-            r#"{"choices":[{"delta":{"content":"Hello"}}]}"#,
-        );
+        process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"Hello"}}]}"#);
         process_chunk(
             &mut state,
             r#"{"choices":[{"delta":{"content":" World"}}]}"#,
         );
-        process_chunk(
-            &mut state,
-            r#"{"choices":[{"delta":{"content":"!"}}]}"#,
-        );
+        process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"!"}}]}"#);
 
         assert_eq!(state.accumulated_text, "Hello World!");
     }
@@ -259,19 +258,13 @@ mod tests {
     fn test_created_event_only_once() {
         let mut state = make_state();
 
-        let events1 = process_chunk(
-            &mut state,
-            r#"{"choices":[{"delta":{"content":"A"}}]}"#,
-        )
-        .unwrap();
+        let events1 =
+            process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"A"}}]}"#).unwrap();
         let has_created1 = events1.iter().any(|e| matches!(e, StreamEvent::Created(_)));
         assert!(has_created1);
 
-        let events2 = process_chunk(
-            &mut state,
-            r#"{"choices":[{"delta":{"content":"B"}}]}"#,
-        )
-        .unwrap();
+        let events2 =
+            process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"B"}}]}"#).unwrap();
         let has_created2 = events2.iter().any(|e| matches!(e, StreamEvent::Created(_)));
         assert!(!has_created2, "Created event should only be emitted once");
     }
@@ -322,7 +315,10 @@ mod tests {
             StreamEvent::Completed(v) => {
                 let output = v["response"]["output"].as_array().unwrap();
                 // Should have a function_call item
-                let fc = output.iter().find(|o| o["type"] == "function_call").unwrap();
+                let fc = output
+                    .iter()
+                    .find(|o| o["type"] == "function_call")
+                    .unwrap();
                 assert_eq!(fc["call_id"], "call_abc");
                 assert_eq!(fc["name"], "get_we");
                 assert!(fc["arguments"].as_str().unwrap().contains("NYC"));
@@ -385,7 +381,10 @@ mod tests {
                 let output = v["response"]["output"].as_array().unwrap();
                 let msg = output.iter().find(|o| o["type"] == "message").unwrap();
                 assert_eq!(msg["content"][0]["text"], "Let me check.");
-                let fc = output.iter().find(|o| o["type"] == "function_call").unwrap();
+                let fc = output
+                    .iter()
+                    .find(|o| o["type"] == "function_call")
+                    .unwrap();
                 assert_eq!(fc["name"], "search");
             }
             other => panic!("Expected Completed, got {:?}", other),
@@ -411,10 +410,7 @@ mod tests {
     #[test]
     fn test_empty_choices_produces_no_events() {
         let mut state = make_state();
-        let events = process_chunk(
-            &mut state,
-            r#"{"choices":[]}"#,
-        );
+        let events = process_chunk(&mut state, r#"{"choices":[]}"#);
         assert!(events.is_none());
     }
 
@@ -457,18 +453,29 @@ data: [DONE]
                 .find(|l| l.starts_with("data:"))
                 .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()));
 
-            if let Some(data) = data_line {
-                if let Some(events) = process_chunk(&mut state, data) {
+            if let Some(data) = data_line
+                && let Some(events) = process_chunk(&mut state, data) {
                     final_events.extend(events);
                 }
-            }
         }
 
         assert_eq!(state.accumulated_text, "Hello");
         // Should have created + text_delta + completed events
-        assert!(final_events.iter().any(|e| matches!(e, StreamEvent::Created(_))));
-        assert!(final_events.iter().any(|e| matches!(e, StreamEvent::TextDelta(_))));
-        assert!(final_events.iter().any(|e| matches!(e, StreamEvent::Completed(_))));
+        assert!(
+            final_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Created(_)))
+        );
+        assert!(
+            final_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(_)))
+        );
+        assert!(
+            final_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Completed(_)))
+        );
     }
 
     #[test]

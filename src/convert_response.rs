@@ -23,9 +23,7 @@ pub fn chat_to_responses(
                     annotations: vec![],
                 });
             }
-        } else if choice.message.content.is_none()
-            && choice.message.tool_calls.is_none()
-        {
+        } else if choice.message.content.is_none() && choice.message.tool_calls.is_none() {
             // Empty content — treat as refusal if content_filter, else empty text
             if choice.finish_reason.as_deref() == Some("content_filter") {
                 content_blocks.push(OutputContentBlock::Refusal {
@@ -157,7 +155,7 @@ mod tests {
             id: "chatcmpl-123".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -177,10 +175,10 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
 
         assert_eq!(resp.object, "response");
-        assert_eq!(resp.model, "gpt-4o");
+        assert_eq!(resp.model, "deepseek-v4-pro");
         assert_eq!(resp.status, "completed");
         assert_eq!(resp.created_at, 1715550000.0);
         assert_eq!(resp.output.len(), 1);
@@ -213,7 +211,7 @@ mod tests {
             id: "chatcmpl-456".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -240,20 +238,18 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
 
         assert_eq!(resp.output.len(), 2);
 
         // First item: message with assistant text
         match &resp.output[0] {
-            OutputItem::Message(msg) => {
-                match &msg.content[0] {
-                    OutputContentBlock::Text { text, .. } => {
-                        assert_eq!(text, "Let me check the weather.");
-                    }
-                    _ => panic!("Expected text"),
+            OutputItem::Message(msg) => match &msg.content[0] {
+                OutputContentBlock::Text { text, .. } => {
+                    assert_eq!(text, "Let me check the weather.");
                 }
-            }
+                _ => panic!("Expected text"),
+            },
             _ => panic!("Expected message"),
         }
 
@@ -274,7 +270,7 @@ mod tests {
             id: "chatcmpl-789".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -288,15 +284,13 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
-                completion_tokens_details: Some(
-                    serde_json::json!({"reasoning_tokens": 20}),
-                ),
+                completion_tokens_details: Some(serde_json::json!({"reasoning_tokens": 20})),
                 prompt_tokens_details: None,
             }),
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let usage = resp.usage.unwrap();
 
         assert_eq!(usage.input_tokens, 100);
@@ -312,7 +306,7 @@ mod tests {
             id: "chatcmpl-multi".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![
                 ChatChoice {
                     index: 0,
@@ -337,7 +331,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         // Only the first choice is used in Responses API output
         assert_eq!(resp.output.len(), 1);
         match &resp.output[0] {
@@ -357,7 +351,7 @@ mod tests {
             id: "chatcmpl-len".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -371,7 +365,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert_eq!(resp.status, "completed");
     }
 
@@ -381,7 +375,7 @@ mod tests {
             id: "chatcmpl-cf".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -395,7 +389,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         match &resp.output[0] {
             OutputItem::Message(msg) => {
                 assert_eq!(msg.status, "incomplete");
@@ -419,7 +413,7 @@ mod tests {
             }),
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert_eq!(resp.status, "failed");
         assert!(resp.error.is_some());
         assert_eq!(resp.output.len(), 0);
@@ -431,7 +425,7 @@ mod tests {
             id: "chatcmpl-reason".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-reasoner".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -445,15 +439,13 @@ mod tests {
                 prompt_tokens: 50,
                 completion_tokens: 100,
                 total_tokens: 150,
-                completion_tokens_details: Some(
-                    serde_json::json!({"reasoning_tokens": 80}),
-                ),
+                completion_tokens_details: Some(serde_json::json!({"reasoning_tokens": 80})),
                 prompt_tokens_details: None,
             }),
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let usage = resp.usage.unwrap();
         assert_eq!(usage.output_tokens_details.reasoning_tokens, 80);
         assert_eq!(usage.output_tokens, 100);
@@ -465,7 +457,7 @@ mod tests {
             id: "some-chat-id-12345".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -479,7 +471,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert!(resp.id.starts_with("resp_"));
     }
 
@@ -489,13 +481,13 @@ mod tests {
             id: "chatcmpl-empty".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![],
             usage: None,
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert_eq!(resp.status, "completed");
         assert_eq!(resp.output.len(), 0);
     }
@@ -507,7 +499,7 @@ mod tests {
             id: "chatcmpl-tools".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -528,7 +520,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert_eq!(resp.output.len(), 1); // just the function_call, no message
         match &resp.output[0] {
             OutputItem::FunctionCall(fc) => {
@@ -544,7 +536,7 @@ mod tests {
             id: "chatcmpl-cf2".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -558,7 +550,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         match &resp.output[0] {
             OutputItem::Message(msg) => {
                 assert_eq!(msg.status, "incomplete");
@@ -579,7 +571,7 @@ mod tests {
             id: "chatcmpl-len2".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -593,7 +585,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let details = resp.incomplete_details.unwrap();
         assert_eq!(details["reason"], "max_output_tokens");
     }
@@ -604,7 +596,7 @@ mod tests {
             id: "chatcmpl-cf3".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -618,7 +610,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let details = resp.incomplete_details.unwrap();
         assert_eq!(details["reason"], "content_filter");
     }
@@ -629,7 +621,7 @@ mod tests {
             id: "chatcmpl-stop".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -643,7 +635,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         assert!(resp.incomplete_details.is_none());
     }
 
@@ -653,7 +645,7 @@ mod tests {
             id: "chatcmpl-cache".into(),
             object: "chat.completion".into(),
             created: 1715550000,
-            model: "deepseek-chat".into(),
+            model: "deepseek-v4-pro".into(),
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatResponseMessage {
@@ -676,7 +668,7 @@ mod tests {
             error: None,
         };
 
-        let resp = chat_to_responses(chat, "gpt-4o".into());
+        let resp = chat_to_responses(chat, "deepseek-v4-pro".into());
         let usage = resp.usage.unwrap();
         assert_eq!(usage.input_tokens_details.cached_tokens, 100); // 80 + 20
         assert_eq!(usage.input_tokens, 100);

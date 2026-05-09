@@ -1,0 +1,25 @@
+server:
+  listen_addr: "0.0.0.0:3000"
+  request_timeout_secs: 120
+
+  # Auth: set enabled: true to require API key authentication
+  auth:
+    enabled: false
+    keys:
+      - sk-your-secret-key-here
+
+  # Tool type allowlist: only these tool types pass through to the downstream
+  # Default: ["function"]
+  tool_type_allowlist:
+    - function
+
+models:
+  - model: deepseek-v4-pro
+    provider:
+      base_url: https://api.deepseek.com
+      api_key: sk-8ce7093c67e54899996dc6885282ddff
+
+  - model: deepseek-v4-flash
+    provider:
+      base_url: https://api.deepseek.com
+      api_key: sk-8ce7093c67e54899996dc6885282ddff

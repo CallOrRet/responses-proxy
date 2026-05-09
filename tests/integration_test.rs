@@ -4,8 +4,7 @@
 ///
 /// Then run tests:
 ///   cargo test --test integration_test -- --nocapture
-
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn proxy_url() -> String {
     std::env::var("PROXY_URL").unwrap_or_else(|_| "http://localhost:3000".to_string())
@@ -14,7 +13,7 @@ fn proxy_url() -> String {
 async fn send_responses_request(body: Value, expect_status: u16) -> Value {
     let client = reqwest::Client::new();
     let response = client
-        .post(&format!("{}/v1/responses", proxy_url()))
+        .post(format!("{}/v1/responses", proxy_url()))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -37,7 +36,7 @@ async fn send_responses_request(body: Value, expect_status: u16) -> Value {
 #[tokio::test]
 async fn test_basic_completion() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": "Reply with exactly: Hello, World!"
     });
 
@@ -54,9 +53,17 @@ async fn test_basic_completion() {
     assert_eq!(output[0]["type"], "message");
     assert_eq!(output[0]["role"], "assistant");
 
-    let content = output[0]["content"].as_array().expect("content should be array");
+    let content = output[0]["content"]
+        .as_array()
+        .expect("content should be array");
     assert_eq!(content[0]["type"], "output_text");
-    assert!(content[0]["text"].as_str().unwrap().to_lowercase().contains("hello"));
+    assert!(
+        content[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("hello")
+    );
 
     let usage = &resp["usage"];
     assert!(usage["input_tokens"].as_u64().unwrap() > 0);
@@ -66,7 +73,7 @@ async fn test_basic_completion() {
 #[tokio::test]
 async fn test_string_input() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": "What is 2+2? Reply with just the number."
     });
 
@@ -79,7 +86,7 @@ async fn test_string_input() {
 #[tokio::test]
 async fn test_with_instructions() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "instructions": "You are a translator. Always translate user messages to Chinese.",
         "input": "Good morning"
     });
@@ -87,13 +94,16 @@ async fn test_with_instructions() {
     let resp = send_responses_request(req, 200).await;
     let text = resp["output"][0]["content"][0]["text"].as_str().unwrap();
     println!("Translation: {text}");
-    assert!(text.chars().any(|c| c as u32 > 127), "Expected Chinese characters in output");
+    assert!(
+        text.chars().any(|c| c as u32 > 127),
+        "Expected Chinese characters in output"
+    );
 }
 
 #[tokio::test]
 async fn test_array_input_with_messages() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": [
             {
                 "type": "message",
@@ -118,7 +128,7 @@ async fn test_array_input_with_messages() {
 #[tokio::test]
 async fn test_temperature_and_max_tokens() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": "Write numbers 1 to 5.",
         "temperature": 0.0,
         "max_output_tokens": 30
@@ -137,7 +147,7 @@ async fn test_temperature_and_max_tokens() {
 #[tokio::test]
 async fn test_multi_turn_conversation() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": [
             {
                 "type": "message",
@@ -169,7 +179,7 @@ async fn test_multi_turn_conversation() {
 #[tokio::test]
 async fn test_tool_calling() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": "What's the weather like in Tokyo? Use the get_weather function.",
         "tools": [{
             "type": "function",
@@ -201,7 +211,10 @@ async fn test_tool_calling() {
     let has_function_call = output.iter().any(|item| item["type"] == "function_call");
 
     if has_function_call {
-        let fc = output.iter().find(|item| item["type"] == "function_call").unwrap();
+        let fc = output
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
         println!(
             "Function call: {} with args: {}",
             fc["name"], fc["arguments"]
@@ -217,13 +230,13 @@ async fn test_tool_calling() {
 #[tokio::test]
 async fn test_model_field_preserved() {
     let req = json!({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "input": "Say 'test'"
     });
 
     let resp = send_responses_request(req, 200).await;
     // The model field should be preserved from the original request
-    assert_eq!(resp["model"], "deepseek-chat");
+    assert_eq!(resp["model"], "deepseek-v4-pro");
 }
 
 #[tokio::test]
@@ -242,19 +255,25 @@ async fn test_response_structure_consistency() {
     // Run multiple requests and verify structure consistency
     for _ in 0..3 {
         let req = json!({
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-pro",
             "input": "Say exactly: OK"
         });
 
         let resp = send_responses_request(req, 200).await;
 
         // Verify all mandatory fields are present
-        assert!(resp.get("id").and_then(|v| v.as_str()).is_some(), "Missing id");
+        assert!(
+            resp.get("id").and_then(|v| v.as_str()).is_some(),
+            "Missing id"
+        );
         assert_eq!(resp["object"], "response", "Missing/invalid object");
         assert!(resp.get("created_at").is_some(), "Missing created_at");
         assert!(resp.get("status").is_some(), "Missing status");
         assert!(resp.get("model").is_some(), "Missing model");
-        assert!(resp.get("output").and_then(|v| v.as_array()).is_some(), "Missing output array");
+        assert!(
+            resp.get("output").and_then(|v| v.as_array()).is_some(),
+            "Missing output array"
+        );
         assert!(resp.get("usage").is_some(), "Missing usage");
 
         // Verify output item structure
