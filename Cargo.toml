@@ -1,0 +1,30 @@
+[package]
+name = "responses-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "A proxy that converts OpenAI Responses API requests to Chat Completions API format and back, enabling any Chat API-compatible provider (e.g. DeepSeek) to serve Responses API clients."
+license = "Apache-2.0"
+repository = "https://github.com/CallOrRet/responses-proxy"
+homepage = "https://github.com/CallOrRet/responses-proxy"
+documentation = "https://docs.rs/responses-proxy"
+readme = "README.md"
+keywords = ["openai", "responses-api", "chat-api", "proxy", "deepseek"]
+categories = ["api-bindings", "web-programming::http-server"]
+authors = ["CallOrRet <CallOrRet@icloud.com>"]
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+futures = "0.3"
+bytes = "1"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
