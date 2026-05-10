@@ -167,7 +167,7 @@ async fn handle_compact(
     let downstream_req = serde_json::json!({
         "model": provider.downstream_model,
         "messages": final_messages,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
     });
 
     let response = state
