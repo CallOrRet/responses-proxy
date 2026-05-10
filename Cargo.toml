@@ -1,6 +1,6 @@
 [package]
 name = "responses-proxy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "OpenAI Responses API proxy over any Chat Completions provider. Supports HTTP SSE and WebSocket streaming, reasoning/thinking content, tool calling, and can serve as a drop-in Codex CLI backend via DeepSeek or other Chat API-compatible models."
 license = "Apache-2.0"
