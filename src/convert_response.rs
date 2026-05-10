@@ -67,9 +67,7 @@ pub fn chat_to_responses(
             Some("length") => Some(serde_json::json!({
                 "reason": "max_output_tokens"
             })),
-            Some("insufficient_system_resource") => Some(serde_json::json!({
-                "reason": "server_error"
-            })),
+            Some("insufficient_system_resource") => None,
             _ => None,
         };
 
@@ -116,12 +114,17 @@ pub fn chat_to_responses(
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
 
+        // OpenAI: prompt_tokens_details.cached_tokens
+        // DeepSeek: prompt_cache_hit_tokens + prompt_cache_miss_tokens
         let cached_tokens = u
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+            .unwrap_or_else(|| {
+                u.prompt_cache_hit_tokens.unwrap_or(0) as u64
+                    + u.prompt_cache_miss_tokens.unwrap_or(0) as u64
+            }) as u32;
 
         ResponseUsage {
             input_tokens: u.prompt_tokens,
@@ -744,7 +747,7 @@ mod tests {
             }
             _ => panic!("Expected message"),
         }
-        let details = resp.incomplete_details.unwrap();
-        assert_eq!(details["reason"], "server_error");
+        // insufficient_system_resource has no standard incomplete_details reason
+        assert!(resp.incomplete_details.is_none());
     }
 }

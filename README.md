@@ -1,15 +1,8 @@
 # responses-proxy
 
-[English](#english) | [中文](#chinese)
-
----
-
-<a name="english"></a>
-## English
-
 A proxy that converts **OpenAI Responses API** to **Chat Completions API** and back. Supports both HTTP SSE and WebSocket streaming, reasoning/thinking content, and tool calling. Works as a drop-in **Codex CLI** backend via DeepSeek or any Chat API-compatible provider.
 
-### Features
+## Features
 
 - **HTTP SSE & WebSocket** — both `POST /v1/responses` (SSE) and `GET /v1/responses` (WebSocket upgrade)
 - **Reasoning / Thinking** — maps `reasoning.effort` to DeepSeek thinking mode, streams `reasoning_text.delta` events
@@ -17,26 +10,30 @@ A proxy that converts **OpenAI Responses API** to **Chat Completions API** and b
 - **Codex CLI Compatible** — handles warmup, `previous_response_id` continuation, and full streaming event chain
 - **Multi-Model** — configurable per-model downstream providers
 
-### Codex CLI
+## Codex CLI
+
+After starting responses-proxy, add the following line to `~/.codex/config.toml`:
+
+```toml
+openai_base_url = "http://localhost:3000/v1"
+```
+
+Then start Codex and it will route all requests through the proxy.
 
 ```bash
-# In codex config, point to this proxy:
-export OPENAI_BASE_URL="http://localhost:3000/v1"
-export OPENAI_API_KEY="sk-your-key"
-
 codex        # uses gpt-5.5 model
 codex review # uses codex-auto-review model (if configured)
 ```
 
-### How It Works
+## How It Works
 
 ```
 Client (Responses API)  →  POST /v1/responses or WS  →  Convert  →  POST /chat/completions  →  Provider
                               ↑                                                              ↓
-                              └──────────────── Convert response back ────────────────────────┘
+                              └──────────────── Convert response back ───────────────────────┘
 ```
 
-### Quick Start
+## Quick Start
 
 ```bash
 # Edit config.yaml with your provider details, then start
@@ -57,16 +54,20 @@ curl http://localhost:3000/v1/responses \
   }'
 ```
 
-### Configuration (`config.yaml`)
+## Configuration (`config.yaml`)
 
 ```yaml
 server:
   listen_addr: "0.0.0.0:3000"
   request_timeout: 30
 
+  # Log level: trace, debug, info, warn, error (default: info)
+  # Overridden by RUST_LOG env var if set.
+  log_level: info
+
   # Authentication (optional)
   auth:
-    enabled: false          # Set to true to require API key
+    enabled: false # Set to true to require API key
     keys:
       - sk-your-key-here
 
@@ -78,8 +79,8 @@ models:
   - model: gpt-5.5
     provider:
       base_url: https://api.deepseek.com
-      api_key: $DEEPSEEK_API_KEY          # or static key
-    downstream_model: deepseek-v4-pro      # optional, defaults to model
+      api_key: $DEEPSEEK_API_KEY # or static key
+    downstream_model: deepseek-v4-pro # optional, defaults to model
 
   - model: codex-auto-review
     provider:
@@ -88,47 +89,47 @@ models:
     downstream_model: deepseek-v4-flash
 ```
 
-### Endpoints
+## Endpoints
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | No | Health check |
-| `GET` | `/v1/models` | Optional | List configured models (OpenAI-compatible format) |
-| `POST` | `/v1/responses` | Optional | Main proxy endpoint |
+| Method | Path            | Auth     | Description                                       |
+| ------ | --------------- | -------- | ------------------------------------------------- |
+| `GET`  | `/health`       | No       | Health check                                      |
+| `GET`  | `/v1/models`    | Optional | List configured models (OpenAI-compatible format) |
+| `POST` | `/v1/responses` | Optional | Main proxy endpoint                               |
 
-### Supported Conversions
+## Supported Conversions
 
-#### Request: Responses API → Chat API
+### Request: Responses API → Chat API
 
-| Responses Field | Chat Field | Notes |
-|---|---|---|
-| `input` (string or array) | `messages` | String → `[{role:"user", content}]`. Array → converts messages, function_call, function_call_output items |
-| `instructions` | system message | Prepended; merged with existing system/developer messages in input |
-| `reasoning` | `thinking` | Maps to DeepSeek `thinking: {type: "enabled"}` |
-| `max_output_tokens` | `max_tokens` | |
-| `tools` (flat) | `tools` (nested) | Wraps fields under `function` key; filtered by `tool_type_allowlist` |
-| `tool_choice` | `tool_choice` | Passthrough |
-| `temperature`, `top_p`, `stream`, `stop`, `top_logprobs` | same | Passthrough |
+| Responses Field                                          | Chat Field       | Notes                                                                                                     |
+| -------------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------- |
+| `input` (string or array)                                | `messages`       | String → `[{role:"user", content}]`. Array → converts messages, function_call, function_call_output items |
+| `instructions`                                           | system message   | Prepended; merged with existing system/developer messages in input                                        |
+| `reasoning`                                              | `thinking`       | Maps to DeepSeek `thinking: {type: "enabled"}`                                                            |
+| `max_output_tokens`                                      | `max_tokens`     |                                                                                                           |
+| `tools` (flat)                                           | `tools` (nested) | Wraps fields under `function` key; filtered by `tool_type_allowlist`                                      |
+| `tool_choice`                                            | `tool_choice`    | Passthrough                                                                                               |
+| `temperature`, `top_p`, `stream`, `stop`, `top_logprobs` | same             | Passthrough                                                                                               |
 
-#### Response: Chat API → Responses API
+### Response: Chat API → Responses API
 
-| Chat Field | Responses Field | Notes |
-|---|---|---|
-| `choices[0].message.content` | `output[{type:"message"}]` | Wrapped in `output_text` content blocks |
-| `choices[0].message.tool_calls` | `output[{type:"function_call"}]` | |
-| `finish_reason=content_filter` + null content | `output[{type:"refusal"}]` | |
-| `usage.prompt_tokens` | `usage.input_tokens` | |
-| `prompt_cache_hit/miss_tokens` | `usage.input_tokens_details.cached_tokens` | Sum of hit + miss |
+| Chat Field                                    | Responses Field                            | Notes                                   |
+| --------------------------------------------- | ------------------------------------------ | --------------------------------------- |
+| `choices[0].message.content`                  | `output[{type:"message"}]`                 | Wrapped in `output_text` content blocks |
+| `choices[0].message.tool_calls`               | `output[{type:"function_call"}]`           |                                         |
+| `finish_reason=content_filter` + null content | `output[{type:"refusal"}]`                 |                                         |
+| `usage.prompt_tokens`                         | `usage.input_tokens`                       |                                         |
+| `prompt_cache_hit/miss_tokens`                | `usage.input_tokens_details.cached_tokens` | Sum of hit + miss                       |
 
-### Streaming
+## Streaming
 
 Set `"stream": true` in the Responses API request. The proxy converts Chat API SSE chunks into Responses API streaming events (`response.created` → `response.output_text.delta` → `response.completed`). Tool call deltas are accumulated across chunks and emitted in the final event.
 
-### Authentication
+## Authentication
 
 When `server.auth.enabled: true`, requests to `/v1/models` and `/v1/responses` require an `Authorization: Bearer <key>` header. The key must match one of the keys in `server.auth.keys`. `/health` is always open.
 
-### Tool Type Allowlist
+## Tool Type Allowlist
 
 `server.tool_type_allowlist` controls which tool types pass through to the downstream provider. Default is `["function"]`. Any tool in the Responses API request whose `type` is not in this list is silently dropped. For example, to also allow web search tools from compatible providers:
 
@@ -139,7 +140,7 @@ server:
     - web_search_preview
 ```
 
-### Environment Variable References
+## Environment Variable References
 
 `base_url` and `api_key` support `$VAR` environment variable references:
 
@@ -149,121 +150,3 @@ provider:
   api_key: $DEEPSEEK_API_KEY    # reads from $DEEPSEEK_API_KEY
   api_key: sk-plain-text-key    # static key
 ```
-
----
-
-<a name="chinese"></a>
-## 中文
-
-将 **OpenAI Responses API** 请求转换为 **Chat Completions API** 格式的代理，使任何兼容 Chat API 的服务商（如 DeepSeek）都能服务 Responses API 客户端。
-
-### 快速开始
-
-```bash
-# 编辑 config.yaml 配置下游服务商信息，然后启动
-cargo run
-# 监听在 0.0.0.0:3000
-```
-
-```bash
-# 查看已配置的模型列表
-curl http://localhost:3000/v1/models
-
-# 发送 Responses API 格式的请求
-curl http://localhost:3000/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5.5",
-    "input": "1+1等于几？只回复数字。"
-  }'
-```
-
-### 配置说明 (`config.yaml`)
-
-```yaml
-server:
-  listen_addr: "0.0.0.0:3000"
-  request_timeout: 30
-
-  # 鉴权配置（可选）
-  auth:
-    enabled: false          # 设为 true 则要求 API Key
-    keys:
-      - sk-你的密钥
-
-  # 工具类型白名单（默认只允许 function）
-  tool_type_allowlist:
-    - function
-
-models:
-  - model: gpt-5.5     # 暴露给 Responses API 客户端的模型名
-    provider:
-      base_url: https://api.deepseek.com
-      api_key: $DEEPSEEK_API_KEY      # 或直接写静态密钥
-    downstream_model: deepseek-v4-pro  # 可选，默认等于 model
-
-  - model: codex-auto-review
-    provider:
-      base_url: https://api.deepseek.com
-      api_key: $DEEPSEEK_API_KEY
-    downstream_model: deepseek-v4-flash
-```
-
-### 端点
-
-| 方法 | 路径 | 鉴权 | 说明 |
-|---|---|---|---|
-| `GET` | `/health` | 否 | 健康检查 |
-| `GET` | `/v1/models` | 可选 | 模型列表（OpenAI 兼容格式） |
-| `POST` | `/v1/responses` | 可选 | 主代理端点 |
-
-### 鉴权
-
-当 `server.auth.enabled: true` 时，`/v1/models` 和 `/v1/responses` 需要在请求头中携带 `Authorization: Bearer <key>`，且 key 必须在 `server.auth.keys` 列表中。`/health` 始终免鉴权。
-
-### 工具类型白名单
-
-`server.tool_type_allowlist` 控制哪些工具类型能够透传到下游。默认只有 `function`。请求中 type 不在白名单内的 tool 会被静默过滤。例如，如果下游支持联网搜索：
-
-```yaml
-server:
-  tool_type_allowlist:
-    - function
-    - web_search_preview
-```
-
-### 环境变量引用
-
-`base_url` 和 `api_key` 支持 `$变量名` 方式引用环境变量：
-
-```yaml
-provider:
-  base_url: $MY_BASE_URL        # 从环境变量读取
-  api_key: $DEEPSEEK_API_KEY    # 从环境变量读取
-  api_key: sk-明文密钥           # 静态密钥
-```
-
-### 请求转换
-
-| Responses 字段 | Chat 字段 | 说明 |
-|---|---|---|
-| `input`（字符串或数组） | `messages` | 字符串→单条 user 消息；数组→转换 message、function_call、function_call_output |
-| `instructions` | system 消息 | 前置插入，与 input 中已有的 system/developer 消息合并 |
-| `reasoning` | `thinking` | 映射为 DeepSeek 的 `thinking: {type: "enabled"}` |
-| `max_output_tokens` | `max_tokens` | |
-| `tools`（扁平） | `tools`（嵌套） | 收进 `function` 键下，受 `tool_type_allowlist` 过滤 |
-| `tool_choice`、`temperature`、`top_p`、`stream`、`stop`、`top_logprobs` | 同 | 透传 |
-
-### 响应转换
-
-| Chat 字段 | Responses 字段 | 说明 |
-|---|---|---|
-| `choices[0].message.content` | `output[{type:"message"}]` | 包裹为 `output_text` 内容块 |
-| `choices[0].message.tool_calls` | `output[{type:"function_call"}]` | |
-| `finish_reason=content_filter` + 空内容 | `output[{type:"refusal"}]` | |
-| `usage.prompt_tokens` | `usage.input_tokens` | |
-| `prompt_cache_hit/miss_tokens` | `usage.input_tokens_details.cached_tokens` | hit + miss 求和 |
-
-### 流式传输
-
-在 Responses API 请求中设置 `"stream": true`。代理会将 Chat API SSE 数据块转换为 Responses API 流式事件（`response.created` → `response.output_text.delta` → `response.completed`）。Tool call 增量数据跨 chunk 累积后在最终事件中完整输出。

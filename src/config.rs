@@ -21,6 +21,12 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     #[serde(default = "default_tool_allowlist")]
     pub tool_type_allowlist: Vec<String>,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".into()
 }
 
 fn default_tool_allowlist() -> Vec<String> {
@@ -56,6 +62,7 @@ impl Default for ServerConfig {
             request_timeout: default_request_timeout(),
             auth: AuthConfig::default(),
             tool_type_allowlist: default_tool_allowlist(),
+            log_level: default_log_level(),
         }
     }
 }
@@ -84,6 +91,7 @@ pub struct ResolvedConfig {
     pub auth_enabled: bool,
     pub auth_keys: HashSet<String>,
     pub tool_type_allowlist: Vec<String>,
+    pub log_level: String,
     pub models: HashMap<String, ResolvedProvider>,
     /// Ordered list of model names for /v1/models
     pub model_names: Vec<String>,
@@ -148,6 +156,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         auth_enabled: config.server.auth.enabled,
         auth_keys: config.server.auth.keys.into_iter().collect::<HashSet<_>>(),
         tool_type_allowlist: config.server.tool_type_allowlist,
+        log_level: config.server.log_level,
         models,
         model_names,
     })

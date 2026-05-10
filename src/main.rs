@@ -36,15 +36,12 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "responses_proxy=info".into()),
-        )
-        .init();
-
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".into());
     let resolved = config::load_config(&config_path).expect("Failed to load config");
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("responses_proxy={}", resolved.log_level).into());
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     tracing::info!(
         "Loaded {} models from {}",
@@ -202,13 +199,15 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         .and_then(|t| serde_json::from_value(t.clone()).ok()),
                     tool_choice: event.get("tool_choice").cloned(),
                     stream: Some(true),
-                    stop: None,
+                    stop: event
+                        .get("stop")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
                     top_logprobs: event["top_logprobs"].as_u64().map(|v| v as u32),
                     previous_response_id: None,
                     store: None,
                     metadata: None,
                     reasoning: event.get("reasoning").cloned(),
-                    text: None,
+                    text: event.get("text").cloned(),
                 };
 
                 let msg_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -272,6 +271,17 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
+                // Snapshot fields for the WS response before moving into responses_to_chat.
+                let ws_temperature = responses_req.temperature;
+                let ws_top_p = responses_req.top_p;
+                let ws_max_output_tokens = responses_req.max_output_tokens;
+                let ws_instructions = responses_req.instructions.clone();
+                let ws_reasoning = responses_req.reasoning.clone();
+                let ws_tools = responses_req.tools.clone();
+                let ws_tool_choice = responses_req.tool_choice.clone();
+                let ws_text = responses_req.text.clone();
+                let ws_top_logprobs = responses_req.top_logprobs;
+
                 let mut chat_req =
                     responses_to_chat(responses_req, &state.config.tool_type_allowlist);
 
@@ -293,19 +303,30 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     .as_secs_f64();
 
                 // Send response.created
+                let base_response = serde_json::json!({
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": now,
+                    "model": model,
+                    "status": "in_progress",
+                    "output": [],
+                    "temperature": ws_temperature,
+                    "top_p": ws_top_p,
+                    "max_output_tokens": ws_max_output_tokens,
+                    "instructions": ws_instructions,
+                    "reasoning": ws_reasoning,
+                    "tools": ws_tools,
+                    "tool_choice": ws_tool_choice,
+                    "text": ws_text,
+                    "top_logprobs": ws_top_logprobs,
+                });
                 tracing::debug!("WS sending response.created");
                 let _ = socket
                     .send(WsMessage::Text(
                         serde_json::json!({
                             "type": "response.created",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "created_at": now,
-                                "model": model,
-                                "status": "in_progress",
-                                "output": []
-                            }
+                            "sequence_number": 0,
+                            "response": &base_response
                         })
                         .to_string()
                         .into(),
@@ -318,14 +339,8 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     .send(WsMessage::Text(
                         serde_json::json!({
                             "type": "response.in_progress",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "created_at": now,
-                                "model": model,
-                                "status": "in_progress",
-                                "output": []
-                            }
+                            "sequence_number": 1,
+                            "response": &base_response
                         })
                         .to_string()
                         .into(),
@@ -384,6 +399,7 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     streaming::StreamState::new(response_id.clone(), msg_id.clone(), model.clone());
                 // Already sent response.created + response.in_progress manually.
                 stream_state.has_started = true;
+                let mut seq: u64 = 2; // 0 = created, 1 = in_progress
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     if let Ok(bytes) = chunk_result {
@@ -402,7 +418,9 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                             {
                                 for event in events {
                                     let et = event.event_type();
-                                    let json = event.to_sse_json();
+                                    let mut json = event.to_sse_json();
+                                    json["sequence_number"] = serde_json::json!(seq);
+                                    seq += 1;
                                     tracing::debug!("WS event: {et} {}", json);
                                     if socket
                                         .send(WsMessage::Text(json.to_string().into()))
@@ -738,6 +756,7 @@ async fn handle_streaming(
         let mut buffer = String::new();
         let mut stream_state =
             streaming::StreamState::new(response_id.clone(), msg_id.clone(), model);
+        let mut seq: u64 = 0;
 
         while let Some(chunk_result) = byte_stream.next().await {
             match chunk_result {
@@ -758,8 +777,10 @@ async fn handle_streaming(
                             && let Some(events) = streaming::process_chunk(&mut stream_state, data)
                         {
                             for event in events {
-                                let sse_event =
-                                    SseEvent::default().json_data(event.to_sse_json()).unwrap();
+                                let mut json = event.to_sse_json();
+                                json["sequence_number"] = serde_json::json!(seq);
+                                seq += 1;
+                                let sse_event = SseEvent::default().json_data(json).unwrap();
                                 if tx.send(Ok(sse_event)).await.is_err() {
                                     return; // client disconnected
                                 }
@@ -790,3 +811,6 @@ async fn handle_streaming(
     let stream = ReceiverStream::new(rx);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
+
+#[cfg(test)]
+mod verification_tests;

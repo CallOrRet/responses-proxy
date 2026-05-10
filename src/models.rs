@@ -150,7 +150,7 @@ pub struct InputReasoning {
 }
 
 /// Tool definition in Responses API format (flattened).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct ToolParam {
     #[serde(rename = "type")]

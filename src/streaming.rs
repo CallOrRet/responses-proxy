@@ -26,6 +26,10 @@ pub struct StreamState {
     /// Whether we've emitted output_item.added for reasoning.
     pub reasoning_item_added: bool,
     pub reasoning_id: String,
+    /// Monotonically increasing counter for assigning output_index to new items.
+    next_output_index: usize,
+    /// Usage data extracted from the final stream chunk (if provider sends it).
+    pub usage: Option<Value>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -38,6 +42,8 @@ pub struct ToolCallAccumulator {
     pub item_added: bool,
     /// Generated output item ID.
     pub fc_id: String,
+    /// The output_index assigned when this item was first added.
+    pub output_index: usize,
 }
 
 impl StreamState {
@@ -56,6 +62,7 @@ impl StreamState {
 #[derive(Debug)]
 pub enum StreamEvent {
     Created(Value),
+    InProgress(Value),
     OutputItemAdded(Value),
     ContentPartAdded(Value),
     OutputTextDelta(Value),
@@ -74,6 +81,7 @@ impl StreamEvent {
     pub fn to_sse_json(&self) -> Value {
         match self {
             StreamEvent::Created(v)
+            | StreamEvent::InProgress(v)
             | StreamEvent::OutputItemAdded(v)
             | StreamEvent::ContentPartAdded(v)
             | StreamEvent::OutputTextDelta(v)
@@ -92,6 +100,7 @@ impl StreamEvent {
     pub fn event_type(&self) -> &str {
         match self {
             StreamEvent::Created(_) => "response.created",
+            StreamEvent::InProgress(_) => "response.in_progress",
             StreamEvent::OutputItemAdded(_) => "response.output_item.added",
             StreamEvent::ContentPartAdded(_) => "response.content_part.added",
             StreamEvent::OutputTextDelta(_) => "response.output_text.delta",
@@ -126,6 +135,14 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
         state.created = created;
     }
 
+    // Capture usage from empty-choices chunk (DeepSeek sends this before [DONE])
+    if chunk["choices"].as_array().map_or(false, |c| c.is_empty()) {
+        if let Some(usage) = chunk.get("usage") {
+            state.usage = Some(usage.clone());
+        }
+        return None;
+    }
+
     let mut events = Vec::new();
     let mut has_content = false;
 
@@ -145,9 +162,11 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
             {
                 has_content = true;
                 if !state.reasoning_item_added {
+                    let idx = state.next_output_index;
+                    state.next_output_index += 1;
                     events.push(StreamEvent::OutputItemAdded(json!({
                         "type": "response.output_item.added",
-                        "output_index": 0,
+                        "output_index": idx,
                         "item": {
                             "type": "reasoning",
                             "id": state.reasoning_id,
@@ -159,7 +178,7 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                     events.push(StreamEvent::ContentPartAdded(json!({
                         "type": "response.content_part.added",
                         "item_id": state.reasoning_id,
-                        "output_index": 0,
+                        "output_index": idx,
                         "content_index": 0,
                         "part": {
                             "type": "reasoning_text",
@@ -184,11 +203,12 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
             {
                 has_content = true;
                 if !state.message_item_added {
-                    let output_index = if state.reasoning_item_added { 1 } else { 0 };
-                    state.msg_output_index = output_index;
+                    let idx = state.next_output_index;
+                    state.next_output_index += 1;
+                    state.msg_output_index = idx;
                     events.push(StreamEvent::OutputItemAdded(json!({
                         "type": "response.output_item.added",
-                        "output_index": output_index,
+                        "output_index": idx,
                         "item": {
                             "type": "message",
                             "id": state.msg_id,
@@ -200,7 +220,7 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                     events.push(StreamEvent::ContentPartAdded(json!({
                         "type": "response.content_part.added",
                         "item_id": state.msg_id,
-                        "output_index": output_index,
+                        "output_index": idx,
                         "content_index": 0,
                         "part": {
                             "type": "output_text",
@@ -245,11 +265,12 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
 
                     // Emit output_item.added on first encounter
                     if !acc.item_added && !acc.id.is_empty() {
-                        let output_index =
-                            (if state.reasoning_item_added { 1 } else { 0 }) + index as usize;
+                        let idx = state.next_output_index;
+                        state.next_output_index += 1;
+                        acc.output_index = idx;
                         events.push(StreamEvent::OutputItemAdded(json!({
                             "type": "response.output_item.added",
-                            "output_index": output_index,
+                            "output_index": idx,
                             "item": {
                                 "type": "function_call",
                                 "id": acc.fc_id,
@@ -269,12 +290,10 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
                         if let Some(args) = func["arguments"].as_str() {
                             acc.arguments.push_str(args);
                             if acc.item_added {
-                                let output_index = (if state.reasoning_item_added { 1 } else { 0 })
-                                    + index as usize;
                                 events.push(StreamEvent::FunctionCallArgumentsDelta(json!({
                                     "type": "response.function_call_arguments.delta",
                                     "item_id": acc.fc_id,
-                                    "output_index": output_index,
+                                    "output_index": acc.output_index,
                                     "delta": args
                                 })));
                             }
@@ -285,12 +304,26 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
         }
     }
 
-    // Emit created event on first content-bearing chunk
+    // Emit created + in_progress on first content-bearing chunk
     if has_content && !state.has_started {
         events.insert(
             0,
             StreamEvent::Created(json!({
                 "type": "response.created",
+                "response": {
+                    "id": state.response_id,
+                    "object": "response",
+                    "created_at": state.created,
+                    "model": state.model,
+                    "status": "in_progress",
+                    "output": []
+                }
+            })),
+        );
+        events.insert(
+            1,
+            StreamEvent::InProgress(json!({
+                "type": "response.in_progress",
                 "response": {
                     "id": state.response_id,
                     "object": "response",
@@ -371,18 +404,17 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
             } else {
                 tc.fc_id.clone()
             };
-            let output_index = (if state.reasoning_item_added { 1 } else { 0 }) + tc.index as usize;
             if tc.item_added {
                 events.push(StreamEvent::FunctionCallArgumentsDone(json!({
                     "type": "response.function_call_arguments.done",
                     "item_id": fc_id,
-                    "output_index": output_index,
+                    "output_index": tc.output_index,
                     "arguments": tc.arguments,
                     "name": tc.name
                 })));
                 events.push(StreamEvent::OutputItemDone(json!({
                     "type": "response.output_item.done",
-                    "output_index": output_index,
+                    "output_index": tc.output_index,
                     "item": {
                         "type": "function_call",
                         "id": fc_id,
@@ -404,25 +436,19 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
         }
     }
 
-    // Close message item last (highest output_index)
+    // Close message item
     if state.message_item_added {
-        let output_index = state.msg_output_index
-            + state
-                .tool_calls
-                .iter()
-                .filter(|tc| !tc.id.is_empty())
-                .count();
         events.push(StreamEvent::OutputTextDone(json!({
             "type": "response.output_text.done",
             "item_id": state.msg_id,
-            "output_index": output_index,
+            "output_index": state.msg_output_index,
             "content_index": 0,
             "text": state.accumulated_text
         })));
         events.push(StreamEvent::ContentPartDone(json!({
             "type": "response.content_part.done",
             "item_id": state.msg_id,
-            "output_index": output_index,
+            "output_index": state.msg_output_index,
             "content_index": 0,
             "part": {
                 "type": "output_text",
@@ -432,7 +458,7 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
         })));
         events.push(StreamEvent::OutputItemDone(json!({
             "type": "response.output_item.done",
-            "output_index": output_index,
+            "output_index": state.msg_output_index,
             "item": {
                 "type": "message",
                 "id": state.msg_id,
@@ -471,15 +497,20 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
         }));
     }
 
+    let mut completed_resp = json!({
+        "id": state.response_id,
+        "object": "response",
+        "model": state.model,
+        "status": "completed",
+        "output": output_items
+    });
+    if let Some(ref usage) = state.usage {
+        completed_resp["usage"] = usage.clone();
+    }
+
     events.push(StreamEvent::Completed(json!({
         "type": "response.completed",
-        "response": {
-            "id": state.response_id,
-            "object": "response",
-            "model": state.model,
-            "status": "completed",
-            "output": output_items
-        }
+        "response": completed_resp
     })));
 
     events
@@ -671,6 +702,66 @@ mod tests {
     }
 
     #[test]
+    fn test_output_index_no_duplicates_message_then_tool() {
+        let mut state = make_state();
+
+        // Text chunk arrives first
+        let events1 = process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"content":"Let me check."}}]}"#,
+        )
+        .unwrap();
+        let text_added = events1
+            .iter()
+            .find(|e| matches!(e, StreamEvent::OutputItemAdded(_)))
+            .unwrap();
+        let msg_idx = match text_added {
+            StreamEvent::OutputItemAdded(v) => v["output_index"].as_u64().unwrap(),
+            _ => panic!(),
+        };
+
+        // Tool call arrives in next chunk
+        let events2 = process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let tc_added = events2
+            .iter()
+            .find(|e| matches!(e, StreamEvent::OutputItemAdded(_)))
+            .unwrap();
+        let tc_idx = match tc_added {
+            StreamEvent::OutputItemAdded(v) => v["output_index"].as_u64().unwrap(),
+            _ => panic!(),
+        };
+
+        assert_ne!(
+            msg_idx, tc_idx,
+            "message and tool_call must have different output_index"
+        );
+        assert_eq!(tc_idx, msg_idx + 1, "tool_call should come after message");
+    }
+
+    #[test]
+    fn test_output_index_no_duplicates_reasoning_text_tool() {
+        let mut state = make_state();
+
+        process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"reasoning_content":"Let me think"}}]}"#,
+        );
+        process_chunk(
+            &mut state,
+            r#"{"choices":[{"delta":{"content":"Answer","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        );
+
+        assert!(state.reasoning_item_added);
+        assert!(state.message_item_added);
+        assert_eq!(state.tool_calls[0].output_index, 2);
+        assert!(state.msg_output_index < state.tool_calls[0].output_index);
+    }
+
+    #[test]
     fn test_role_only_delta_produces_no_events() {
         let mut state = make_state();
 
@@ -759,19 +850,32 @@ data: [DONE]
     }
 
     #[test]
-    fn test_usage_chunk_in_streaming() {
+    fn test_usage_chunk_captured() {
         let mut state = make_state();
         state.accumulated_text = "Answer".into();
 
-        // DeepSeek can send a usage chunk before [DONE] with stream_options
-        let _events = process_chunk(
+        // DeepSeek sends usage chunk before [DONE]
+        let events = process_chunk(
             &mut state,
-            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3}}}"#,
         );
+        // Usage-only chunk should not emit events
+        assert!(events.is_none());
+        // But usage should be captured
+        assert!(state.usage.is_some());
+        assert_eq!(state.usage.as_ref().unwrap()["prompt_tokens"], 10);
 
-        // Usage chunk with empty choices → no events
-        // State should be unchanged
-        assert_eq!(state.accumulated_text, "Answer");
+        // [DONE] should include usage in completed
+        let events = process_chunk(&mut state, "[DONE]").unwrap();
+        match find_completed(&events) {
+            StreamEvent::Completed(v) => {
+                let usage = &v["response"]["usage"];
+                assert_eq!(usage["prompt_tokens"], 10);
+                assert_eq!(usage["completion_tokens"], 5);
+                assert_eq!(usage["total_tokens"], 15);
+            }
+            other => panic!("Expected Completed, got {:?}", other),
+        }
     }
 
     #[test]
@@ -849,5 +953,27 @@ data: [DONE]
             }
             other => panic!("Expected Completed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_in_progress_emitted_after_created() {
+        let mut state = make_state();
+
+        let events =
+            process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"Hi"}}]}"#).unwrap();
+
+        // Created first, then InProgress
+        let created_pos = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Created(_)))
+            .unwrap();
+        let in_progress_pos = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::InProgress(_)))
+            .unwrap();
+        assert!(
+            created_pos < in_progress_pos,
+            "created must come before in_progress"
+        );
     }
 }

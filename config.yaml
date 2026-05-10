@@ -1,4 +1,9 @@
 server:
+  # Log level for tracing output (trace, debug, info, warn, error)
+  # Can be overridden by the RUST_LOG environment variable.
+  # Default: info
+  log_level: info
+
   listen_addr: "0.0.0.0:3000"
   request_timeout: 30
 
