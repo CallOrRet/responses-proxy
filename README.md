@@ -52,7 +52,7 @@ curl http://localhost:3000/v1/models
 curl http://localhost:3000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-pro",
+    "model": "gpt-5.5",
     "input": "What is 2+2? Reply with just the number."
   }'
 ```
@@ -75,16 +75,17 @@ server:
     - function
 
 models:
-  - model: deepseek-v4-pro
+  - model: gpt-5.5
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY          # or static key
-    downstream_model: deepseek-chat      # optional, defaults to model
+    downstream_model: deepseek-v4-pro      # optional, defaults to model
 
-  - model: deepseek-v4-flash
+  - model: codex-auto-review
     provider:
       base_url: https://api.deepseek.com
-      api_key: sk-xxx
+      api_key: $DEEPSEEK_API_KEY
+    downstream_model: deepseek-v4-flash
 ```
 
 ### Endpoints
@@ -172,7 +173,7 @@ curl http://localhost:3000/v1/models
 curl http://localhost:3000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-v4-pro",
+    "model": "gpt-5.5",
     "input": "1+1等于几？只回复数字。"
   }'
 ```
@@ -195,11 +196,17 @@ server:
     - function
 
 models:
-  - model: deepseek-v4-pro      # 暴露给 Responses API 客户端的模型名
+  - model: gpt-5.5     # 暴露给 Responses API 客户端的模型名
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY      # 或直接写静态密钥
-    downstream_model: deepseek-chat  # 可选，默认等于 model
+    downstream_model: deepseek-v4-pro  # 可选，默认等于 model
+
+  - model: codex-auto-review
+    provider:
+      base_url: https://api.deepseek.com
+      api_key: $DEEPSEEK_API_KEY
+    downstream_model: deepseek-v4-flash
 ```
 
 ### 端点
