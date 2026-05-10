@@ -212,7 +212,26 @@ pub fn responses_to_chat(
     };
 
     // 5. Map `text.format` → `response_format`
-    let response_format = req.text.as_ref().and_then(|t| t.get("format")).cloned();
+    // Codex sends {type, name, schema, strict} at the top level for json_schema
+    // but DeepSeek requires {type, json_schema: {name, schema, strict}}.
+    let response_format = req.text.as_ref().and_then(|t| t.get("format")).map(|f| {
+        if f.get("type").and_then(|v| v.as_str()) == Some("json_schema")
+            && f.get("json_schema").is_none()
+        {
+            let mut inner = serde_json::Map::new();
+            for key in ["name", "schema", "strict", "description"] {
+                if let Some(v) = f.get(key) {
+                    inner.insert(key.to_string(), v.clone());
+                }
+            }
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": inner
+            })
+        } else {
+            f.clone()
+        }
+    });
 
     let chat_req = ChatCompletionRequest {
         model: req.model,
