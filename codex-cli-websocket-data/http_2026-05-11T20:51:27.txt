@@ -1,0 +1,35 @@
+# POST https://api.anthropic.com/api/event_logging/v2/batch
+# Time: 2026-05-11T20:51:27
+
+>>> REQUEST >>>
+POST https://api.anthropic.com/api/event_logging/v2/batch
+Accept: application/json, text/plain, */*
+Accept-Encoding: gzip, compress, deflate, br
+Content-Type: application/json
+User-Agent: claude-code/2.1.138
+x-service-name: claude-code
+Host: api.anthropic.com
+Content-Length: 1803
+
+{"events":[{"event_type":"ClaudeCodeInternalEvent","event_data":{"event_name":"tengu_api_slow_first_byte","client_timestamp":"2026-05-11T12:51:17.174Z","model":"deepseek-v4-pro[1m]","session_id":"648d47b1-b8b1-4f50-b474-2a586555936c","user_type":"external","betas":"claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05","env":{"platform":"linux","node_version":"v24.3.0","terminal":"xterm","package_managers":"npm,yarn,pnpm","runtimes":"bun,node","is_running_with_bun":true,"is_ci":false,"is_claubbit":false,"is_github_action":false,"is_claude_code_action":false,"is_claude_ai_auth":false,"version":"2.1.138","arch":"arm64","is_claude_code_remote":false,"deployment_environment":"docker","is_conductor":false,"version_base":"2.1.138","build_time":"2026-05-09T04:04:51Z","is_local_agent_mode":false,"linux_distro_id":"ubuntu","linux_distro_version":"24.04","linux_kernel":"7.0.5-orbstack-00330-ge3df4e19b0a0-dirty","vcs":"git","platform_raw":"linux","shell":"none"},"entrypoint":"cli","is_interactive":true,"client_type":"cli","process":"eyJ1cHRpbWUiOjIxMy4zNzA2NDI4NzMsInJzcyI6MjU2NjYzNTUyLCJoZWFwVG90YWwiOjYyMjY0MzIwLCJoZWFwVXNlZCI6NjY2MTc0NzcsImV4dGVybmFsIjoyOTM5NjU1MywiYXJyYXlCdWZmZXJzIjo3NDA1OTQsImNvbnN0cmFpbmVkTWVtb3J5Ijo4MzgyMTY5MDg4LCJjcHVVc2FnZSI6eyJ1c2VyIjoyMjU1NDc5MSwic3lzdGVtIjoyNTM0OTIyfSwiY3B1UGVyY2VudCI6MTYuOTI5ODg4OTczNTA1OTUzfQ==","additional_metadata":"eyJyaCI6IjE2MDBmMzBiODkwMjllMmMiLCJyZW5kZXJlcl9tb2RlIjoiZGVmYXVsdCIsIm1vZGVsIjoiZGVlcHNlZWstdjQtcHJvWzFtXSIsInByb3ZpZGVyIjoiZmlyc3RQYXJ0eSIsImF0dGVtcHQiOjEsImVsYXBzZWRfbXMiOjMwMDAyfQ==","event_id":"9dcc2479-bd77-4a44-bdf4-963eec6c71cc","device_id":"b113d4623f52b9d503f23e54f98b8db3b1025834c3566d320151c130afa71a88"}}]}
+
+<<< RESPONSE <<<
+Status: 200
+Date: Mon, 11 May 2026 12:51:27 GMT
+Content-Type: application/json
+Transfer-Encoding: chunked
+Connection: keep-alive
+request-id: req_011Cavp3F17gAFyFwXBqGrTw
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+Server: cloudflare
+x-envoy-upstream-service-time: 14
+Content-Encoding: gzip
+vary: Accept-Encoding
+server-timing: x-originResponse;dur=16
+cf-cache-status: DYNAMIC
+set-cookie: _cfuvid=J1CDYviNvBsndwpcrsIn7WJ3fymP4.i8zezqMLXkJ1s-1778503887.5249443-1.0.1.1-xUW76XDfCCBnGLHGnj9WAxlQDJ1_ULSOUJGCHIQRDNM; HttpOnly; SameSite=None; Secure; Path=/; Domain=api.anthropic.com
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+X-Robots-Tag: none
+CF-RAY: 9fa150b10f74d4ff-NRT
+
+{"accepted_count":1,"rejected_count":0}

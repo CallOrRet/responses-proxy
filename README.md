@@ -58,35 +58,40 @@ curl http://localhost:3000/v1/responses \
 
 ```yaml
 server:
-  listen_addr: "0.0.0.0:3000"
-  request_timeout: 30
+  listen: "0.0.0.0:3000"       # default
+  timeout: 600                  # default request timeout in seconds
 
   # Log level: trace, debug, info, warn, error (default: info)
   # Overridden by RUST_LOG env var if set.
   log_level: info
 
-  # Authentication (optional)
+  # Authentication – if any keys are set, auth is required
   auth:
-    enabled: false # Set to true to require API key
-    keys:
-      - sk-your-key-here
+    keys: []
+    # Example with keys:
+    # keys:
+    #   - sk-your-key-here
+
+  # CORS allow origins. Empty = allow any.
+  cors:
+    allow_origins: []
 
   # Tool type allowlist (default: ["function"])
   tool_type_allowlist:
     - function
 
 models:
-  - model: gpt-5.5
+  gpt-5.5:
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY # or static key
-    downstream_model: deepseek-v4-pro # optional, defaults to model
+    model: deepseek-v4-pro # optional, defaults to the key name
 
-  - model: codex-auto-review
+  codex-auto-review:
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY
-    downstream_model: deepseek-v4-flash
+    model: deepseek-v4-flash
 ```
 
 ## Endpoints
@@ -127,7 +132,7 @@ Set `"stream": true` in the Responses API request. The proxy converts Chat API S
 
 ## Authentication
 
-When `server.auth.enabled: true`, requests to `/v1/models` and `/v1/responses` require an `Authorization: Bearer <key>` header. The key must match one of the keys in `server.auth.keys`. `/health` is always open.
+When `server.auth.keys` contains at least one key, requests to authenticated endpoints require an `Authorization: Bearer <key>` header that matches one of the configured keys. `/health` is always open.
 
 ## Tool Type Allowlist
 

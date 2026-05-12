@@ -1,42 +1,48 @@
+# ── Server ─────────────────────────────────────────────────────────────
 server:
-  # Log level for tracing output (trace, debug, info, warn, error)
-  # Can be overridden by the RUST_LOG environment variable.
-  # Default: info
+  # Listen address. Default: "0.0.0.0:3000" (optional)
+  listen: "0.0.0.0:3000"
+
+  # Default request timeout in seconds. Default: 600 (optional)
+  timeout: 600
+
+  # Log level: trace | debug | info | warn | error.
+  # Can be overridden by RUST_LOG. Default: info (optional)
   log_level: info
 
   # AES-256-GCM key for compact summary encryption (64 hex chars = 32 bytes).
-  # Leave empty to skip encryption (plain text).
-  compact_encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  # Default: "" (no encryption) (optional)
+  compact_encryption_key: ""
 
-  listen_addr: "0.0.0.0:3000"
-  request_timeout: 30
-
-  # Auth: set enabled: true to require API key authentication
+  # API key authentication. If at least one key is present, auth is enabled.
+  # Default: no keys (auth disabled) (optional)
   auth:
-    enabled: false
-    keys:
-      - sk-your-secret-key-here
+    keys: []
+    # Example:
+    # keys:
+    #   - sk-your-secret-key-here
 
-  # Tool type allowlist: only these tool types pass through to the downstream
-  # Default: ["function"]
+  # CORS allow origins. Empty = allow any origin. Default: [] (optional)
+  cors:
+    allow_origins: []
+
+  # Tool type allowlist. Default: ["function"] (optional)
   tool_type_allowlist:
     - function
 
+# ── Models ─────────────────────────────────────────────────────────────
 models:
-  - model: gpt-5.4
+  gpt-5.5:
+    # Downstream model name. Defaults to the key name. (optional)
+    model: deepseek-v4-pro
     provider:
       api_key: $DEEPSEEK_API_KEY
       base_url: https://api.deepseek.com
-    downstream_model: deepseek-v4-pro
+      # Per-provider timeout in seconds. Falls back to server.timeout. (optional)
+      timeout: 60
 
-  - model: gpt-5.5
+  codex-auto-review:
+    model: deepseek-v4-flash
     provider:
       api_key: $DEEPSEEK_API_KEY
       base_url: https://api.deepseek.com
-    downstream_model: deepseek-v4-pro
-
-  - model: codex-auto-review
-    provider:
-      api_key: $DEEPSEEK_API_KEY
-      base_url: https://api.deepseek.com
-    downstream_model: deepseek-v4-flash

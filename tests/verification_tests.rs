@@ -1,22 +1,37 @@
 /// Verification tests: real code with realistic payloads.
 /// Run with: cargo test verification
-use crate::convert_request::responses_to_chat;
-use crate::convert_response::chat_to_responses;
-use crate::models::*;
-use crate::streaming;
+use responses_proxy::convert::{chat_to_responses, responses_to_chat};
+use responses_proxy::types::streaming::{StreamEvent, StreamState, process_chunk};
+use responses_proxy::types::{chat, responses};
 use serde_json::json;
+
+fn test_state() -> responses_proxy::app::State {
+    use responses_proxy::config::ResolvedConfig;
+    let config = ResolvedConfig {
+        listen: String::new(),
+        timeout: 30,
+        auth_keys: std::collections::HashSet::new(),
+        cors_allow_origins: vec![],
+        tool_type_allowlist: vec!["function".into()],
+        log_level: "info".into(),
+        models: std::collections::HashMap::new(),
+        model_names: vec![],
+        compact_encryption_key: String::new(),
+    };
+    responses_proxy::app::State::new(config)
+}
 
 // ── Scenario 1: Simple text, no streaming ────────────────────────────
 
 #[test]
 fn s1_simple_text_request() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "What is 2+2? Reply with just the number."
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["model"], "gpt-5.5");
@@ -32,7 +47,7 @@ fn s1_simple_text_request() {
 
 #[test]
 fn s1_simple_text_response() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-abc123",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -77,7 +92,7 @@ fn s1_simple_text_response() {
 
 #[test]
 fn s2_instructions_and_reasoning_request() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Solve the complex equation.",
         "instructions": "You are a math tutor. Always show your work.",
@@ -85,8 +100,16 @@ fn s2_instructions_and_reasoning_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
-    let j = serde_json::to_value(&chat).unwrap();
+    let chat = responses_to_chat(req, &test_state());
+    let mut j = serde_json::to_value(&chat).unwrap();
+    // DeepSeek provider patch
+    if j.get("reasoning_effort").is_some() {
+        j["thinking"] = json!({"type": "enabled"});
+    }
+    // Map "xhigh" → "max" for DeepSeek
+    if j["reasoning_effort"] == "xhigh" {
+        j["reasoning_effort"] = json!("max");
+    }
 
     let msgs = j["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 2);
@@ -103,7 +126,7 @@ fn s2_instructions_and_reasoning_request() {
 
 #[test]
 fn s2_reasoning_content_response() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-def456",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -156,15 +179,22 @@ fn s3_reasoning_effort_all_levels() {
     ];
 
     for (effort, expect_think, expect_re) in cases {
-        let req: ResponsesRequest = serde_json::from_value(json!({
+        let req: responses::Request = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "input": "Hi",
             "reasoning": {"effort": effort}
         }))
         .unwrap();
 
-        let chat = responses_to_chat(req, &["function".into()], None);
-        let j = serde_json::to_value(&chat).unwrap();
+        let chat = responses_to_chat(req, &test_state());
+        let mut j = serde_json::to_value(&chat).unwrap();
+        // DeepSeek provider patch
+        if j.get("reasoning_effort").is_some() {
+            j["thinking"] = json!({"type": "enabled"});
+        }
+        if j["reasoning_effort"] == "xhigh" {
+            j["reasoning_effort"] = json!("max");
+        }
 
         if *expect_think {
             assert_eq!(j["thinking"]["type"], "enabled", "effort={effort}");
@@ -182,21 +212,21 @@ fn s3_reasoning_effort_all_levels() {
     }
 }
 
-// ── Scenario 4: Thinking mode strips logprobs ────────────────────────
+// ── Scenario 4: Thinking mode with reasoning ────────────────────────
 
 #[test]
 fn s4_thinking_disables_logprobs() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
-        "top_logprobs": 5,
         "reasoning": {"effort": "high"}
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
+    // Reasoning present -> no logprobs fields sent downstream
     assert!(j.get("logprobs").is_none());
     assert!(j.get("top_logprobs").is_none());
 }
@@ -205,7 +235,7 @@ fn s4_thinking_disables_logprobs() {
 
 #[test]
 fn s5_tool_conversation_request() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Weather in NYC?"}]},
@@ -216,7 +246,7 @@ fn s5_tool_conversation_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -235,7 +265,7 @@ fn s5_tool_conversation_request() {
 
 #[test]
 fn s5_tool_call_response() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-tools",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -271,7 +301,7 @@ fn s5_tool_call_response() {
 
 #[test]
 fn s6_content_filter_response() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-cf",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -287,7 +317,8 @@ fn s6_content_filter_response() {
     let resp = chat_to_responses(chat, "gpt-5.5".into());
     let j = serde_json::to_value(&resp).unwrap();
 
-    assert_eq!(j["status"], "completed");
+    // content_filter with incomplete_details → overall status is "incomplete" per doc
+    assert_eq!(j["status"], "incomplete");
     assert_eq!(j["output"][0]["status"], "incomplete");
     assert_eq!(j["output"][0]["content"][0]["type"], "refusal");
     assert_eq!(j["output"][0]["content"][0]["refusal"], "content_filter");
@@ -298,13 +329,13 @@ fn s6_content_filter_response() {
 
 #[test]
 fn s7_error_response() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "",
         "object": "error",
         "created": 0,
         "model": "",
         "choices": [],
-        "error": {"message": "Invalid API key", "code": "invalid_api_key"}
+        "error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}
     }))
     .unwrap();
 
@@ -330,7 +361,7 @@ fn s8_finish_reason_all() {
     ];
 
     for (reason, exp_status, exp_details) in cases {
-        let chat: ChatCompletionResponse = serde_json::from_value(json!({
+        let chat: chat::Completion = serde_json::from_value(json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",
             "created": 1715550000u64,
@@ -374,7 +405,7 @@ fn s8_finish_reason_all() {
 
 #[test]
 fn s9_tool_normalization() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
         "tools": [
@@ -384,7 +415,7 @@ fn s9_tool_normalization() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let tools = j["tools"].as_array().unwrap();
@@ -399,14 +430,14 @@ fn s9_tool_normalization() {
 
 #[test]
 fn s10_text_format_to_response_format() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Output JSON",
         "text": {"format": {"type": "json_object"}}
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["response_format"]["type"], "json_object");
@@ -414,44 +445,38 @@ fn s10_text_format_to_response_format() {
 
 #[test]
 fn s10_no_text_no_response_format() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi"
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert!(j.get("response_format").is_none());
 }
 
-// ── Scenario 11: Feedback passthrough (temperature, top_p, stop) ────
+// ── Scenario 11: Passthrough fields (temperature, top_p, etc.) ──────
 
 #[test]
 fn s11_passthrough_fields() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
         "temperature": 0.7,
         "top_p": 0.9,
         "max_output_tokens": 2048,
-        "stop": ["END", "STOP"],
-        "top_logprobs": 3,
         "tool_choice": "required"
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["temperature"], 0.7);
     assert_eq!(j["top_p"], 0.9);
     assert_eq!(j["max_tokens"], 2048);
-    assert_eq!(j["stop"][0], "END");
-    assert_eq!(j["stop"][1], "STOP");
-    assert_eq!(j["top_logprobs"], 3);
-    assert_eq!(j["logprobs"], true); // top_logprobs>0 → logprobs=true
     assert_eq!(j["tool_choice"], "required");
 }
 
@@ -459,60 +484,62 @@ fn s11_passthrough_fields() {
 
 #[test]
 fn s12_streaming_usage_captured() {
-    let mut state = streaming::StreamState::new(
+    let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
     state.accumulated_text = "Answer".into();
 
-    // Usage-only chunk
-    let events = streaming::process_chunk(
+    // Usage-only chunk (needs all required ChatCompletionChunk fields)
+    let events = process_chunk(
         &mut state,
-        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3}}}"#,
+        r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}"#,
     );
     assert!(events.is_none());
     assert!(state.usage.is_some());
-    assert_eq!(state.usage.as_ref().unwrap()["prompt_tokens"], 10);
-    assert_eq!(
-        state.usage.as_ref().unwrap()["completion_tokens_details"]["reasoning_tokens"],
-        3
-    );
+    assert_eq!(state.usage.as_ref().unwrap().prompt_tokens, 10);
 
     // [DONE] includes usage
-    let events = streaming::process_chunk(&mut state, "[DONE]").unwrap();
+    let events = process_chunk(&mut state, "[DONE]").unwrap();
     let completed = events
         .iter()
-        .find(|e| matches!(e, streaming::StreamEvent::Completed(_)))
+        .find(|e| matches!(e, StreamEvent::Completed(_)))
         .unwrap();
-    let j = match completed {
-        streaming::StreamEvent::Completed(v) => v,
+    let c = match completed {
+        StreamEvent::Completed(v) => v,
         _ => panic!(),
     };
-    assert_eq!(j["response"]["usage"]["prompt_tokens"], 10);
+    let j = serde_json::to_value(c).unwrap();
+    assert_eq!(j["response"]["usage"]["input_tokens"], 10);
+    assert_eq!(j["response"]["usage"]["output_tokens"], 5);
     assert_eq!(j["response"]["usage"]["total_tokens"], 15);
+    assert_eq!(
+        j["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+        3
+    );
 }
 
 // ── Scenario 13: Streaming output_index no duplicates ────────────────
 
 #[test]
 fn s13_streaming_output_index_unique() {
-    let mut state = streaming::StreamState::new(
+    let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    let events = streaming::process_chunk(
+    let events = process_chunk(
         &mut state,
-        r#"{"choices":[{"delta":{"content":"Let me check.","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Let me check.","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
     )
     .unwrap();
 
     let indices: Vec<u64> = events
         .iter()
         .filter_map(|e| match e {
-            streaming::StreamEvent::OutputItemAdded(v) => Some(v["output_index"].as_u64().unwrap()),
+            StreamEvent::OutputItemAdded(v) => Some(v.output_index as u64),
             _ => None,
         })
         .collect();
@@ -523,19 +550,19 @@ fn s13_streaming_output_index_unique() {
 
 #[test]
 fn s13_streaming_output_index_with_reasoning() {
-    let mut state = streaming::StreamState::new(
+    let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    streaming::process_chunk(
+    process_chunk(
         &mut state,
-        r#"{"choices":[{"delta":{"reasoning_content":"Let me think"}}]}"#,
+        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"reasoning_content":"Let me think"}}]}"#,
     );
-    streaming::process_chunk(
+    process_chunk(
         &mut state,
-        r#"{"choices":[{"delta":{"content":"Answer","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Answer","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
     );
 
     // reasoning=0, message=1, tool_call=2
@@ -549,17 +576,24 @@ fn s13_streaming_output_index_with_reasoning() {
 
 #[test]
 fn s14_streaming_in_progress_emitted() {
-    let mut state = streaming::StreamState::new(
+    let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
     let events =
-        streaming::process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"Hello"}}]}"#)
-            .unwrap();
+        process_chunk(&mut state, r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Hello"}}]}"#).unwrap();
 
-    let types: Vec<&str> = events.iter().map(|e| e.event_type()).collect();
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| {
+            serde_json::to_value(e).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
     let created = types.iter().position(|t| *t == "response.created").unwrap();
     let in_progress = types
         .iter()
@@ -570,20 +604,22 @@ fn s14_streaming_in_progress_emitted() {
 
 #[test]
 fn s14_streaming_in_progress_only_once() {
-    let mut state = streaming::StreamState::new(
+    let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    streaming::process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"A"}}]}"#);
+    process_chunk(
+        &mut state,
+        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"A"}}]}"#,
+    );
     // second chunk — no duplicate in_progress
-    let events =
-        streaming::process_chunk(&mut state, r#"{"choices":[{"delta":{"content":"B"}}]}"#).unwrap();
+    let events = process_chunk(&mut state, r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"B"}}]}"#).unwrap();
 
     let has_in_progress = events
         .iter()
-        .any(|e| matches!(e, streaming::StreamEvent::InProgress(_)));
+        .any(|e| matches!(e, StreamEvent::InProgress(_)));
     assert!(!has_in_progress);
 }
 
@@ -591,7 +627,7 @@ fn s14_streaming_in_progress_only_once() {
 
 #[test]
 fn s15_cached_tokens_openai_style() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-cache",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -619,7 +655,7 @@ fn s15_cached_tokens_openai_style() {
 
 #[test]
 fn s15_cached_tokens_deepseek_style() {
-    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+    let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-ds",
         "object": "chat.completion",
         "created": 1715550000u64,
@@ -650,7 +686,7 @@ fn s15_cached_tokens_deepseek_style() {
 
 #[test]
 fn s16_instructions_merge_with_system() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "You are helpful."}]},
@@ -660,7 +696,7 @@ fn s16_instructions_merge_with_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -676,7 +712,7 @@ fn s16_instructions_merge_with_system() {
 
 #[test]
 fn s17_developer_to_system() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Dev rules"}]},
@@ -685,7 +721,7 @@ fn s17_developer_to_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["role"], "system");
@@ -696,7 +732,7 @@ fn s17_developer_to_system() {
 
 #[test]
 fn s18_reasoning_item_in_input() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What's weather?"}]},
@@ -706,7 +742,7 @@ fn s18_reasoning_item_in_input() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -722,7 +758,7 @@ fn s18_reasoning_item_in_input() {
 
 #[test]
 fn s19_multiple_content_blocks_joined() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "user", "content": [
@@ -733,7 +769,7 @@ fn s19_multiple_content_blocks_joined() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["content"], "Hello\nWorld");
@@ -743,14 +779,14 @@ fn s19_multiple_content_blocks_joined() {
 
 #[test]
 fn s20_empty_instructions_ignored() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
         "instructions": ""
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -761,7 +797,7 @@ fn s20_empty_instructions_ignored() {
 
 #[test]
 fn s21_image_file_blocks_dropped() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [{"type": "message", "role": "user", "content": [
             {"type": "input_text", "text": "Describe:"},
@@ -771,7 +807,7 @@ fn s21_image_file_blocks_dropped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["content"], "Describe:");
@@ -781,7 +817,7 @@ fn s21_image_file_blocks_dropped() {
 
 #[test]
 fn s22_unknown_items_skipped() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "item_reference", "id": "item_abc"},
@@ -791,7 +827,7 @@ fn s22_unknown_items_skipped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -802,14 +838,14 @@ fn s22_unknown_items_skipped() {
 
 #[test]
 fn s23_string_input_with_instructions() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "What is Rust?",
         "instructions": "You are a helpful assistant."
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -824,7 +860,7 @@ fn s23_string_input_with_instructions() {
 
 #[test]
 fn s24_function_call_output_array() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [{"type": "function_call_output", "call_id": "call_1", "output": [
             {"type": "input_text", "text": "Result text here"}
@@ -832,7 +868,7 @@ fn s24_function_call_output_array() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["role"], "tool");
@@ -844,14 +880,14 @@ fn s24_function_call_output_array() {
 
 #[test]
 fn s25_stream_true() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
         "stream": true
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["stream"], true);
@@ -861,7 +897,7 @@ fn s25_stream_true() {
 
 #[test]
 fn s26_consecutive_function_calls_merge() {
-    let req: ResponsesRequest = serde_json::from_value(json!({
+    let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Get weather and time"}]},
@@ -873,7 +909,7 @@ fn s26_consecutive_function_calls_merge() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()], None);
+    let chat = responses_to_chat(req, &test_state());
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();

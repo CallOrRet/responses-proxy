@@ -58,35 +58,40 @@ curl http://localhost:3000/v1/responses \
 
 ```yaml
 server:
-  listen_addr: "0.0.0.0:3000"
-  request_timeout: 30
+  listen: "0.0.0.0:3000"       # 默认值
+  timeout: 600                  # 默认请求超时（秒）
 
   # 日志级别: trace, debug, info, warn, error（默认: info）
   # 可通过 RUST_LOG 环境变量覆盖。
   log_level: info
 
-  # 鉴权配置（可选）
+  # 鉴权 — 只要 keys 非空即启用鉴权
   auth:
-    enabled: false # 设为 true 则要求 API Key
-    keys:
-      - sk-你的密钥
+    keys: []
+    # 示例（启用鉴权）:
+    # keys:
+    #   - sk-你的密钥
+
+  # CORS 允许来源。空 = 允许任意来源。
+  cors:
+    allow_origins: []
 
   # 工具类型白名单（默认只允许 function）
   tool_type_allowlist:
     - function
 
 models:
-  - model: gpt-5.5 # 暴露给 Responses API 客户端的模型名
+  gpt-5.5: # 暴露给 Responses API 客户端的模型名
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY # 或直接写静态密钥
-    downstream_model: deepseek-v4-pro # 可选，默认等于 model
+    model: deepseek-v4-pro # 可选，默认等于键名
 
-  - model: codex-auto-review
+  codex-auto-review:
     provider:
       base_url: https://api.deepseek.com
       api_key: $DEEPSEEK_API_KEY
-    downstream_model: deepseek-v4-flash
+    model: deepseek-v4-flash
 ```
 
 ## 端点
@@ -124,7 +129,7 @@ models:
 
 ## 鉴权
 
-当 `server.auth.enabled: true` 时，`/v1/models` 和 `/v1/responses` 需要在请求头中携带 `Authorization: Bearer <key>`，且 key 必须在 `server.auth.keys` 列表中。`/health` 始终免鉴权。
+当 `server.auth.keys` 至少包含一个 key 时，需要鉴权的端点必须携带 `Authorization: Bearer <key>` 请求头，且 key 必须在配置的 keys 列表中。`/health` 始终免鉴权。
 
 ## 工具类型白名单
 
