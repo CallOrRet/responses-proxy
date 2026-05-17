@@ -704,4 +704,79 @@ mod tests {
         // unchanged — * expands to nothing on non-array
         assert_eq!(body, json!({"messages": "not-an-array"}));
     }
+
+    #[test]
+    fn deepseek_config_wildcard_developer_to_system() {
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "max_completion_tokens": 64,
+            "store": true,
+            "verbosity": "low",
+            "parallel_tool_calls": true,
+            "reasoning_effort": "none",
+            "response_format": {"type": "json_schema", "json_schema": {}},
+            "messages": [
+                {"role": "developer", "content": "You are helpful"},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let rewrite = RewriteConfig {
+            steps: vec![
+                RewriteStep::Rename(vec![("max_completion_tokens".into(), "max_tokens".into())]),
+                RewriteStep::Replace(vec![
+                    (
+                        "messages.*.role".into(),
+                        vec![replace_value(json!("developer"), json!("system"))],
+                    ),
+                    (
+                        "reasoning_effort".into(),
+                        vec![replace_paths(
+                            json!("^none$"),
+                            vec![("thinking.type", json!("disabled"))],
+                        )],
+                    ),
+                    (
+                        "thinking.type".into(),
+                        vec![replace_paths(
+                            json!("^disabled$"),
+                            vec![("reasoning_effort", json!(null))],
+                        )],
+                    ),
+                    (
+                        "response_format.type".into(),
+                        vec![replace_value(json!("^json_schema$"), json!("json_object"))],
+                    ),
+                ]),
+                RewriteStep::Remove(vec![
+                    "store".into(),
+                    "verbosity".into(),
+                    "parallel_tool_calls".into(),
+                    "response_format.json_schema".into(),
+                ]),
+            ],
+        };
+
+        apply_rewrite(&mut body, &rewrite).unwrap();
+
+        // Rename
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["max_tokens"], 64);
+
+        // Wildcard replace: developer → system
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user"); // unchanged
+
+        // reasoning_effort none → thinking.type=disabled → reasoning_effort=null
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").unwrap().is_null());
+
+        // response_format.type
+        assert_eq!(body["response_format"]["type"], "json_object");
+
+        // Removed
+        assert!(body.get("store").is_none());
+        assert!(body.get("verbosity").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body["response_format"].get("json_schema").is_none());
+    }
 }

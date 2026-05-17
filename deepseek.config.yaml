@@ -47,6 +47,10 @@ rewrites:
           with:
             thinking:
               type: enabled
+      thinking.type:
+        - if: "^disabled$"
+          with:
+            reasoning_effort: null
         # DeepSeek reasoning_effort only accepts high / max
       response_format.type:
         - if: "^json_schema$"

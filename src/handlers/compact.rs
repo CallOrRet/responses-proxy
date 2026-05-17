@@ -44,27 +44,31 @@ pub async fn compact(
     let upstream_req = chat::Request {
         model: provider.model.clone(),
         messages,
-        temperature: None,
-        top_p: None,
         max_tokens: Some(33000),
-        tools: None,
-        tool_choice: None,
-        response_format: None,
-        stop: None,
-        logprobs: None,
-        top_logprobs: None,
-        reasoning_effort: Some(crate::types::ReasoningEffort::None),
         ..Default::default()
     };
-    // Send to upstream Chat API
+
+    // Send to upstream Chat API (apply chat-out rewrite if configured)
     let url = format!("{}/chat/completions", provider.base_url);
     let request = state
         .http_client()
         .post(&url)
         .timeout(provider.timeout)
         .header("Authorization", format!("Bearer {}", provider.api_key))
-        .header("Content-Type", "application/json")
-        .json(&upstream_req);
+        .header("Content-Type", "application/json");
+    let request = if provider.rewrite.chat_out.is_empty() {
+        request.json(&upstream_req)
+    } else {
+        let mut body = serde_json::to_value(&upstream_req).map_err(|e| {
+            let err = Error::server_error(e.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+        })?;
+        crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out).map_err(|msg| {
+            let err = Error::server_error(msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+        })?;
+        request.json(&body)
+    };
     let response = request.send().await.map_err(|e| {
         let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
@@ -81,7 +85,23 @@ pub async fn compact(
         return Err((StatusCode::BAD_GATEWAY, Json(err.to_http_json())));
     }
 
-    let chat_resp: Completion = serde_json::from_str(&body_text).map_err(|e| {
+    // Apply chat-in rewrite if configured
+    let chat_resp: Completion = if provider.rewrite.chat_in.is_empty() {
+        serde_json::from_str(&body_text)
+    } else {
+        let mut resp_value: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+            let err = Error::server_error(e.to_string());
+            (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+        })?;
+        crate::rewrite::apply_rewrite(&mut resp_value, &provider.rewrite.chat_in).map_err(
+            |msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+            },
+        )?;
+        serde_json::from_value(resp_value)
+    }
+    .map_err(|e| {
         let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
