@@ -170,18 +170,16 @@ pub async fn responses_to_chat(
                         &mut pending_reasoning,
                     );
                     messages.append(&mut deferred);
-                    // Decrypt and insert as a system message
-                    if let Some(ref ec) = c.created_by
+                    // Decrypt encrypted_content into a system message
+                    if let Some(ref encrypted) = c.encrypted_content
                         && let Some(key) = state.compact_key()
+                        && let Some(decrypted) = crate::crypto::decrypt(key, encrypted)
+                        && !decrypted.is_empty()
                     {
-                        let decrypted =
-                            crate::crypto::decrypt(key, ec).unwrap_or_else(|| ec.clone());
-                        if !decrypted.is_empty() {
-                            messages.push(chat::MessageRequest::System(chat::SystemMessage {
-                                content: chat::MessageContent::Text(decrypted),
-                                name: None,
-                            }));
-                        }
+                        messages.push(chat::MessageRequest::System(chat::SystemMessage {
+                            content: chat::MessageContent::Text(decrypted),
+                            name: None,
+                        }));
                     }
                 }
                 InputItem::FunctionCall(fc) => {
@@ -469,18 +467,16 @@ pub fn items_to_chat_messages(
                     &mut pending_reasoning,
                 );
                 messages.append(&mut deferred);
-                // Decrypt compaction content into a system message
-                if let Some(ref ec) = c.created_by {
-                    let text = match state.compact_key() {
-                        Some(key) => crate::crypto::decrypt(key, ec).unwrap_or_else(|| ec.clone()),
-                        None => ec.clone(),
-                    };
-                    if !text.is_empty() {
-                        messages.push(chat::MessageRequest::System(chat::SystemMessage {
-                            content: chat::MessageContent::Text(text),
-                            name: None,
-                        }));
-                    }
+                // Decrypt encrypted_content into a system message
+                if let Some(ref encrypted) = c.encrypted_content
+                    && let Some(key) = state.compact_key()
+                    && let Some(text) = crate::crypto::decrypt(key, encrypted)
+                    && !text.is_empty()
+                {
+                    messages.push(chat::MessageRequest::System(chat::SystemMessage {
+                        content: chat::MessageContent::Text(text),
+                        name: None,
+                    }));
                 }
             }
             InputItem::FunctionCall(fc) => {

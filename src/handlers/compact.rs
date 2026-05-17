@@ -135,26 +135,38 @@ pub async fn compact(
     };
 
     let compaction_id = format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
 
-    // Wrap the summary as a message inside the compaction output item
-    let output = vec![OutputItem::Compaction(Compaction {
-        id: Some(compaction_id),
-        encrypted_content: None,
-        status: Some("completed".into()),
-        output: vec![OutputItem::Message(OutputMessage {
-            id: msg_id,
-            role: "assistant".into(),
-            status: "completed".into(),
-            content: vec![OutputContentBlock::Text {
-                text: summary_text.to_string(),
-                annotations: vec![],
-                logprobs: None,
-            }],
-            phase: None,
-        })],
-        created_by: None,
-    })];
+    // If compaction key is configured, encrypt the summary into
+    // `encrypted_content`; otherwise embed it as a plain-text message.
+    let output = if let Some(key) = state.compact_key() {
+        let encrypted = crate::crypto::encrypt(key, summary_text);
+        vec![OutputItem::Compaction(Compaction {
+            id: Some(compaction_id),
+            encrypted_content: encrypted,
+            status: Some("completed".into()),
+            output: vec![],
+            created_by: None,
+        })]
+    } else {
+        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        vec![OutputItem::Compaction(Compaction {
+            id: Some(compaction_id),
+            encrypted_content: None,
+            status: Some("completed".into()),
+            output: vec![OutputItem::Message(OutputMessage {
+                id: msg_id,
+                role: "assistant".into(),
+                status: "completed".into(),
+                content: vec![OutputContentBlock::Text {
+                    text: summary_text.to_string(),
+                    annotations: vec![],
+                    logprobs: None,
+                }],
+                phase: None,
+            })],
+            created_by: None,
+        })]
+    };
 
     Ok(Json(CompactedResponse {
         id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),

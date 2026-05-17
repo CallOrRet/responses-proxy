@@ -4,6 +4,7 @@ server:
   log-level: debug
   allowed-tool-types:
     - function
+  compact-encryption-key: "9db1ce5a9266c866e56073c590fae9b99b2d8385f19768736bf4c5bc75fb274d"
 
 models:
   gpt-5.5:

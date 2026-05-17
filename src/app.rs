@@ -18,7 +18,7 @@ pub fn ensure_dirs() {
     let home = home_dir();
     std::fs::create_dir_all(&home).ok();
     std::fs::create_dir_all(home.join("prompts")).ok();
-    std::fs::create_dir_all(home.join("store")).ok();
+    std::fs::create_dir_all(home.join("messages")).ok();
 }
 
 // ── Shared application state ─────────────────────────────────────────────
