@@ -38,6 +38,7 @@ rewrites:
               type: disabled
         # Rewrite rules are chained in the order written. Handle high/xhigh
         # before broad rules that would change reasoning_effort.
+        # DeepSeek reasoning_effort only accepts high / max
         - if: "^(high|xhigh)$"
           set: max
           with:
@@ -52,7 +53,6 @@ rewrites:
         - if: "^disabled$"
           with:
             reasoning_effort: null
-        # DeepSeek reasoning_effort only accepts high / max
       response_format.type:
         - if: "^json_schema$"
           set: json_object
