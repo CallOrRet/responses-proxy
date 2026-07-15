@@ -247,11 +247,16 @@ pub fn process_chunk_value(
         state.created = chunk.created;
     }
 
-    // Usage-only chunk (choices empty, usage present) — store usage, no events
+    // Capture usage from any chunk that carries it. OpenAI/DeepSeek send it in a
+    // trailing usage-only chunk (choices empty), but some providers (e.g. z.ai)
+    // attach it to the final content chunk (finish_reason set, choices non-empty),
+    // so guarding usage capture on an empty choices list would drop it there.
+    if let Some(ref usage) = chunk.usage {
+        state.usage = Some(usage.clone());
+    }
+
+    // Usage-only chunk (choices empty) carries no content events.
     if chunk.choices.is_empty() {
-        if let Some(ref usage) = chunk.usage {
-            state.usage = Some(usage.clone());
-        }
         return None;
     }
 

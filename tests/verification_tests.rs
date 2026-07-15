@@ -725,6 +725,43 @@ async fn s12_streaming_usage_captured() {
     );
 }
 
+// ── Scenario 12b: Usage attached to the final content chunk ──────────
+// Regression: some providers (e.g. z.ai) put `usage` on the final content
+// chunk (finish_reason set, choices non-empty) instead of a trailing
+// usage-only chunk (choices empty). Usage must be captured there too, so
+// response.completed carries token counts.
+#[tokio::test]
+async fn s12b_streaming_usage_on_content_chunk() {
+    let mut state = StreamState::new("resp_test".into(), "msg_test".into(), "test".into());
+
+    // Final content chunk: non-empty choice with finish_reason, plus usage.
+    let events = process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"test","choices":[{"index":0,"delta":{"content":"Answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#).unwrap(),
+    );
+    // A content chunk still emits events, and usage is captured despite the
+    // choices list being non-empty.
+    assert!(events.is_some());
+    assert!(state.usage.is_some());
+    assert_eq!(state.usage.as_ref().unwrap().prompt_tokens, 10);
+    assert_eq!(state.usage.as_ref().unwrap().completion_tokens, 5);
+
+    // Usage flows through to the final Responses body.
+    let events = build_completion_events(&mut state);
+    let completed = events
+        .iter()
+        .find(|e| matches!(e, StreamEvent::Completed(_)))
+        .unwrap();
+    let c = match completed {
+        StreamEvent::Completed(v) => v,
+        _ => panic!(),
+    };
+    let j = serde_json::to_value(c).unwrap();
+    assert_eq!(j["response"]["usage"]["input_tokens"], 10);
+    assert_eq!(j["response"]["usage"]["output_tokens"], 5);
+    assert_eq!(j["response"]["usage"]["total_tokens"], 15);
+}
+
 // ── Scenario 13: Streaming output_index no duplicates ────────────────
 
 #[tokio::test]
