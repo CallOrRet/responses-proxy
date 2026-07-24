@@ -2,6 +2,7 @@
 name = "responses-proxy"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "OpenAI Responses API proxy over any Chat Completions provider. Supports HTTP SSE and WebSocket streaming, reasoning/thinking content, tool calling, and can serve as a drop-in Codex CLI backend via DeepSeek or other Chat API-compatible models."
 license = "Apache-2.0"
 repository = "https://github.com/CallOrRet/responses-proxy"

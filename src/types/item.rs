@@ -1129,7 +1129,10 @@ mod tests {
             _ => panic!("expected CompactionTrigger variant, got {item:?}"),
         }
         let roundtripped = serde_json::to_value(&item).unwrap();
-        assert_eq!(roundtripped, serde_json::json!({ "type": "compaction_trigger" }));
+        assert_eq!(
+            roundtripped,
+            serde_json::json!({ "type": "compaction_trigger" })
+        );
     }
 
     #[test]
