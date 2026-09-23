@@ -1,5 +1,5 @@
 use crate::config::ResolvedProvider;
-use crate::types::chat::{self, Completion, MessageRequest};
+use crate::types::chat::{self, MessageRequest};
 use crate::types::item::{Compaction, OutputContentBlock, OutputItem, OutputMessage};
 use crate::types::responses::{self, CompactedResponse, Error, Request};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
@@ -13,15 +13,24 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 /// compaction output item.
 pub async fn compact(
     State(state): State<crate::app::State>,
-    Json(req): Json<Request>,
+    super::json::ResponsesJson(req): super::json::ResponsesJson<Request>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let provider = state.config().models.get(&req.model).ok_or_else(|| {
         let err = Error::invalid_request(format!("Unknown model: {}", req.model));
         (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
     })?;
 
-    let (output, usage, created_at) =
-        build_compaction_output(&state, provider, req.previous_response_id.as_deref()).await?;
+    // The standalone endpoint also carries the live history in `req.input`
+    // (Codex replays it every turn under store:false), so convert it and use it
+    // as the summary source.
+    let current_messages = crate::convert::items_to_chat_messages(&req.input, &state);
+    let (output, usage, created_at) = build_compaction_output(
+        &state,
+        provider,
+        req.previous_response_id.as_deref(),
+        current_messages,
+    )
+    .await?;
 
     Ok(Json(CompactedResponse {
         id: format!("rcmp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
@@ -37,16 +46,27 @@ pub async fn compact(
 /// can package the data into either a `CompactedResponse` (for the standalone
 /// `/v1/responses/compact` endpoint) or a normal `responses::Response` /
 /// SSE stream (for the in-band `compaction_trigger` flow on `/v1/responses`).
+///
+/// `current_messages` is the live history converted from the request's `input`
+/// items. Codex CLI runs with `store:false` and replays the full conversation
+/// in `input` on every turn, so the request itself is the authoritative source
+/// of history; the stored continuation chain (keyed by `previous_response_id`)
+/// is only a fallback for clients that rely on server-side state.
 pub(crate) async fn build_compaction_output(
     state: &crate::app::State,
     provider: &ResolvedProvider,
     previous_response_id: Option<&str>,
+    current_messages: Vec<MessageRequest>,
 ) -> Result<(Vec<OutputItem>, responses::Usage, i64), (StatusCode, Json<serde_json::Value>)> {
-    // Walk the stored continuation chain so compaction sees the same replay
-    // history that previous_response_id continuation would use.
-    let mut messages: Vec<MessageRequest> = match previous_response_id {
-        Some(pid) => state.store().get(pid).await.unwrap_or_default(),
-        None => vec![],
+    // Prefer the live history replayed in `input`; fall back to the stored
+    // continuation chain only when the request carried no history.
+    let mut messages: Vec<MessageRequest> = if !current_messages.is_empty() {
+        current_messages
+    } else {
+        match previous_response_id {
+            Some(pid) => state.store().get(pid).await.unwrap_or_default(),
+            None => vec![],
+        }
     };
 
     // Append the summary prompt as a user message
@@ -58,80 +78,93 @@ pub(crate) async fn build_compaction_output(
         name: None,
     }));
 
-    // Build upstream request (non-streaming, no tools, reasoning disabled)
+    // Bound the summary request the same way the main request path is bounded:
+    // drop oldest turns to fit the message-count limit, then shrink old tool
+    // outputs to the char budget. The summary prompt is the trailing user turn,
+    // so it is always retained.
+    let dropped =
+        crate::convert::enforce_message_budget(&mut messages, provider.max_input_messages);
+    if dropped > 0 {
+        tracing::info!(
+            max_messages = provider.max_input_messages,
+            dropped_messages = dropped,
+            "Compaction input exceeded history.max-input-messages — dropped oldest turns"
+        );
+    }
+    if let Some(max_chars) = provider.max_input_chars {
+        crate::convert::enforce_input_budget(&mut messages, max_chars);
+    }
+
+    // Build upstream request. Send it **streaming**: the summary can be up to
+    // `max_tokens` long, and on a slow origin behind Cloudflare a buffered
+    // (non-streaming) call blows past the ~100s origin-timeout window → 524,
+    // which kills compaction and traps Codex in a retry loop. Streaming emits
+    // the first byte quickly and keeps the connection alive.
     let upstream_req = chat::Request {
         model: provider.model.clone(),
         messages,
         max_tokens: Some(33000),
+        stream: Some(true),
+        stream_options: Some(chat::StreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        }),
         ..Default::default()
     };
 
-    // Send to upstream Chat API (apply chat-out rewrite if configured)
     let url = format!("{}/chat/completions", provider.base_url);
-    let request = state
-        .http_client()
-        .post(&url)
-        .timeout(provider.timeout)
-        .header("Authorization", format!("Bearer {}", provider.api_key))
-        .header("Content-Type", "application/json");
-    let request = if provider.rewrite.chat_out.is_empty() {
-        request.json(&upstream_req)
-    } else {
-        let mut body = serde_json::to_value(&upstream_req).map_err(|e| {
-            let err = Error::server_error(e.to_string());
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-        })?;
-        crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out).map_err(|msg| {
-            let err = Error::server_error(msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
-        })?;
-        request.json(&body)
-    };
+    let request =
+        crate::upstream::build_typed_chat_request(state.http_client(), provider, &upstream_req)
+            .map_err(|msg| {
+                let err = Error::server_error(msg);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
+            })?;
+    let started = std::time::Instant::now();
     let response = request.send().await.map_err(|e| {
         let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
 
     let status = response.status();
-    let body_text = response.text().await.map_err(|e| {
-        let err = Error::server_error(e.to_string());
-        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-    })?;
-
     if !status.is_success() {
-        let err = Error::server_error(format!("Upstream returned {status}: {body_text}"));
+        let body_text = response.text().await.unwrap_or_default();
+        let snippet = if body_text.len() > 200 {
+            &body_text[..200]
+        } else {
+            &body_text
+        };
+        tracing::warn!(
+            endpoint = %url,
+            model = %provider.model,
+            upstream_status = status.as_u16(),
+            streaming = true,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            snippet = %snippet,
+            "Compaction upstream request failed"
+        );
+        let err = Error::server_error(format!("Upstream returned {status}: {snippet}"));
         return Err((StatusCode::BAD_GATEWAY, Json(err.to_http_json())));
     }
 
-    // Apply chat-in rewrite if configured
-    let chat_resp: Completion = if provider.rewrite.chat_in.is_empty() {
-        serde_json::from_str(&body_text)
-    } else {
-        let mut resp_value: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
-            let err = Error::server_error(e.to_string());
+    // Drain the SSE stream into an accumulator (client-facing events discarded).
+    let ss = crate::upstream::drain_chat_stream(response, &provider.rewrite.chat_in)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                endpoint = %url,
+                model = %provider.model,
+                streaming = true,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "Compaction upstream stream drain failed"
+            );
+            let err = Error::server_error(e);
             (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
         })?;
-        crate::rewrite::apply_rewrite(&mut resp_value, &provider.rewrite.chat_in).map_err(
-            |msg| {
-                let err = Error::server_error(msg);
-                (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-            },
-        )?;
-        serde_json::from_value(resp_value)
-    }
-    .map_err(|e| {
-        let err = Error::server_error(e.to_string());
-        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-    })?;
 
-    // Extract the summary text from the upstream response
-    let summary_text = chat_resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
+    let summary_text = ss.accumulated_text.as_str();
 
-    let usage = match chat_resp.usage {
+    let usage = match ss.usage {
         Some(u) => responses::Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -151,12 +184,24 @@ pub(crate) async fn build_compaction_output(
             },
         },
     };
+    let created = ss.created;
 
-    let compaction_id = format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let output = build_compaction_item(state.compact_key(), summary_text);
 
-    // If compaction key is configured, encrypt the summary into
-    // `encrypted_content`; otherwise embed it as a plain-text message.
-    let output = if let Some(key) = state.compact_key() {
+    Ok((output, usage, created))
+}
+
+/// Build the `compaction` output item from a summary. Extracted so the id prefix
+/// and the encrypted/plaintext branches are unit-testable without a live
+/// upstream. The item id uses OpenAI's `cmp_` convention — the other minted ids
+/// already use OpenAI's real prefixes (resp_/msg_/rs_/fc_), and a `comp_` outlier
+/// here is rejected by strict Responses backends when a session started on this
+/// proxy is later replayed against them. With a compaction key the summary is
+/// encrypted into `encrypted_content`; otherwise it is embedded as a plain-text
+/// message.
+fn build_compaction_item(compact_key: Option<&[u8; 32]>, summary_text: &str) -> Vec<OutputItem> {
+    let compaction_id = format!("cmp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    if let Some(key) = compact_key {
         let encrypted = crate::crypto::encrypt(key, summary_text);
         vec![OutputItem::Compaction(Compaction {
             id: Some(compaction_id),
@@ -184,7 +229,42 @@ pub(crate) async fn build_compaction_output(
             })],
             created_by: None,
         })]
-    };
+    }
+}
 
-    Ok((output, usage, chat_resp.created))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_item_id_uses_cmp_prefix() {
+        // Plaintext branch (no key): id starts with `cmp_` and the summary is
+        // embedded as a nested message.
+        let out = build_compaction_item(None, "a summary");
+        let OutputItem::Compaction(c) = &out[0] else {
+            panic!("expected compaction item");
+        };
+        assert!(
+            c.id.as_deref().unwrap_or_default().starts_with("cmp_"),
+            "id = {:?}",
+            c.id
+        );
+        assert!(c.encrypted_content.is_none());
+        assert_eq!(c.output.len(), 1);
+    }
+
+    #[test]
+    fn compaction_item_encrypts_with_key() {
+        // Encrypted branch: id still `cmp_`; the summary rides in
+        // encrypted_content and round-trips back to the plaintext.
+        let key = [7u8; 32];
+        let out = build_compaction_item(Some(&key), "secret summary");
+        let OutputItem::Compaction(c) = &out[0] else {
+            panic!("expected compaction item");
+        };
+        assert!(c.id.as_deref().unwrap_or_default().starts_with("cmp_"));
+        assert!(c.output.is_empty());
+        let decrypted = crate::crypto::decrypt(&key, c.encrypted_content.as_ref().unwrap());
+        assert_eq!(decrypted.as_deref(), Some("secret summary"));
+    }
 }

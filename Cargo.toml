@@ -1,6 +1,6 @@
 [package]
 name = "responses-proxy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "OpenAI Responses API proxy over any Chat Completions provider. Supports HTTP SSE and WebSocket streaming, reasoning/thinking content, tool calling, and can serve as a drop-in Codex CLI backend via DeepSeek or other Chat API-compatible models."
 license = "Apache-2.0"
@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm = "0.10"
 hex = "0.4"
 rand = "0.10"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "decompression-full"] }
 serde_yaml = "0.9"
 futures = "0.3"
 bytes = "1"
@@ -41,3 +41,4 @@ regex = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+zstd = "0.13"

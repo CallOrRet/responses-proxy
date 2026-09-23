@@ -1,3 +1,4 @@
+use crate::types::ReasoningEffort;
 use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,12 @@ pub struct ServerConfig {
     pub log_level: String,
     #[serde(default)]
     pub compact_encryption_key: String,
+    #[serde(default = "default_max_body_mb")]
+    pub max_body_mb: usize,
+}
+
+fn default_max_body_mb() -> usize {
+    100
 }
 
 fn default_log_level() -> String {
@@ -63,6 +70,7 @@ impl Default for ServerConfig {
             allowed_tool_types: default_allowed_tool_types(),
             log_level: default_log_level(),
             compact_encryption_key: String::new(),
+            max_body_mb: default_max_body_mb(),
         }
     }
 }
@@ -92,6 +100,92 @@ pub struct ModelEntry {
     pub model: Option<String>,
     #[serde(default)]
     pub rewrite: Option<RewriteEntry>,
+    #[serde(default)]
+    pub history: Option<HistoryConfig>,
+    /// Reasoning tiers advertised to Codex for this model. Controls what the
+    /// Codex `/model` picker offers; omit to use the built-in default set.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
+    /// Whether the upstream can stream structured output (`response_format`
+    /// json_schema/json_object with `stream: true`). Some gateways reject that
+    /// combination; set `false` and the proxy fetches the response
+    /// non-streamed, then re-emits it to the client as a single SSE burst.
+    /// Defaults to `true` (pass streaming through unchanged).
+    #[serde(default, rename = "stream-structured-output")]
+    pub stream_structured_output: Option<bool>,
+    /// Maximum number of tools forwarded to the upstream in a single request.
+    /// Some gateways reject requests carrying more than a fixed number of tools;
+    /// Codex code mode can flatten a large MCP/app-tool registry into hundreds of
+    /// functions, so cap it here. When the converted tool list exceeds this, the
+    /// leading tools (Codex lists its core coding tools first) are kept and the
+    /// overflow is dropped. `0` (the default) disables the cap.
+    #[serde(default, rename = "max-tools")]
+    pub max_tools: usize,
+}
+
+/// Per-model history controls. `max-input-chars` caps the total size of the
+/// converted Chat request; when the replayed history exceeds it, the oldest
+/// tool outputs are truncated until the request fits.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HistoryConfig {
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
+    #[serde(default = "default_max_input_messages")]
+    pub max_input_messages: usize,
+    /// Context window (in tokens) advertised to Codex via `/v1/models`. Codex
+    /// keys its client-side auto-compaction off this size. When set it
+    /// overrides whatever the upstream advertises; when unset the proxy trusts
+    /// the upstream's own context length (or omits it, letting Codex fall back
+    /// to its bundled default).
+    #[serde(default)]
+    pub context_window: Option<i64>,
+}
+
+fn default_max_input_messages() -> usize {
+    1000
+}
+
+/// Per-model reasoning tiers advertised to Codex via the native `/v1/models`
+/// catalog. Codex builds its `/model` picker verbatim from `levels` (in order),
+/// so a model that advertises only `medium` shows only Medium. `default` anchors
+/// the picker's default selection.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ReasoningConfig {
+    /// Ordered reasoning tiers to advertise. Order is preserved in the picker.
+    #[serde(default)]
+    pub levels: Option<Vec<ReasoningEffort>>,
+    /// Default reasoning tier the picker anchors to.
+    #[serde(default, rename = "default")]
+    pub default_level: Option<ReasoningEffort>,
+}
+
+/// Built-in tiers advertised when a model has no explicit `reasoning` block.
+/// `max`/`ultra` only exist on the provider's `/v1/messages` endpoint, so a
+/// model routing them through Chat Completions must clamp them via a rewrite.
+fn default_reasoning_levels() -> Vec<ReasoningEffort> {
+    vec![
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+        ReasoningEffort::Ultra,
+    ]
+}
+
+/// Resolve a model's advertised reasoning tiers and default, applying built-in
+/// defaults when the block (or its fields) is absent or empty.
+fn resolve_reasoning(cfg: Option<&ReasoningConfig>) -> (Vec<ReasoningEffort>, ReasoningEffort) {
+    let levels = cfg
+        .and_then(|c| c.levels.clone())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(default_reasoning_levels);
+    let default_level = cfg
+        .and_then(|c| c.default_level.clone())
+        .unwrap_or(ReasoningEffort::Medium);
+    (levels, default_level)
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -522,6 +616,22 @@ pub struct ResolvedProvider {
     pub model: String,
     pub timeout: Duration,
     pub rewrite: RewriteProfile,
+    /// Total character ceiling for the converted Chat request, if configured.
+    pub max_input_chars: Option<usize>,
+    /// Maximum number of messages in the converted Chat request. 0 = unlimited.
+    pub max_input_messages: usize,
+    /// Maximum number of tools forwarded to the upstream. `0` = no cap.
+    pub max_tools: usize,
+    /// Whether the upstream can stream structured output. When `false`, the
+    /// proxy buffers a non-streamed upstream response and replays it as SSE.
+    pub stream_structured_output: bool,
+    /// Context window (tokens) to advertise to Codex, overriding the upstream's
+    /// own value. `None` means trust the upstream (or Codex's bundled default).
+    pub context_window: Option<i64>,
+    /// Reasoning tiers advertised to Codex, in picker order. Never empty.
+    pub reasoning_levels: Vec<ReasoningEffort>,
+    /// Default reasoning tier advertised to Codex.
+    pub default_reasoning_level: ReasoningEffort,
 }
 
 #[derive(Debug, Clone)]
@@ -535,6 +645,8 @@ pub struct ResolvedConfig {
     pub models: HashMap<String, ResolvedProvider>,
     pub model_names: Vec<String>,
     pub compact_encryption_key: String,
+    /// Maximum incoming request body size in bytes (after decompression).
+    pub max_body_bytes: usize,
 }
 
 impl ResolvedConfig {
@@ -587,6 +699,16 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
             .timeout
             .map(Duration::from_secs)
             .unwrap_or(default_timeout);
+        let max_input_chars = entry.history.as_ref().and_then(|h| h.max_input_chars);
+        let max_input_messages = entry
+            .history
+            .as_ref()
+            .map(|h| h.max_input_messages)
+            .unwrap_or_else(default_max_input_messages);
+        let stream_structured_output = entry.stream_structured_output.unwrap_or(true);
+        let context_window = entry.history.as_ref().and_then(|h| h.context_window);
+        let (reasoning_levels, default_reasoning_level) =
+            resolve_reasoning(entry.reasoning.as_ref());
 
         models.insert(
             logical_name.clone(),
@@ -596,6 +718,13 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
                 model,
                 timeout,
                 rewrite,
+                max_input_chars,
+                max_input_messages,
+                max_tools: entry.max_tools,
+                stream_structured_output,
+                context_window,
+                reasoning_levels,
+                default_reasoning_level,
             },
         );
         model_names.push(logical_name.clone());
@@ -617,6 +746,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         models,
         model_names,
         compact_encryption_key: config.server.compact_encryption_key,
+        max_body_bytes: config.server.max_body_mb * 1024 * 1024,
     })
 }
 
@@ -847,6 +977,117 @@ models:
         )
         .unwrap();
         assert_eq!(c.models["gpt-5"].model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_history_and_body_defaults() {
+        let c = parse(
+            "
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+",
+        )
+        .unwrap();
+        assert_eq!(c.models["gpt-4"].max_input_messages, 1000);
+        assert_eq!(c.max_body_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_history_and_body_overrides() {
+        let c = parse(
+            "
+server:
+  max-body-mb: 25
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+    history:
+      max-input-messages: 50
+      max-input-chars: 200000
+",
+        )
+        .unwrap();
+        assert_eq!(c.models["gpt-4"].max_input_messages, 50);
+        assert_eq!(c.models["gpt-4"].max_input_chars, Some(200000));
+        assert_eq!(c.max_body_bytes, 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_reasoning_defaults_when_absent() {
+        let c = parse(
+            "
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+",
+        )
+        .unwrap();
+        let p = &c.models["gpt-4"];
+        assert_eq!(
+            p.reasoning_levels,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+                ReasoningEffort::Ultra,
+            ]
+        );
+        assert_eq!(p.default_reasoning_level, ReasoningEffort::Medium);
+    }
+
+    #[test]
+    fn test_reasoning_override() {
+        let c = parse(
+            "
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+    reasoning:
+      default: xhigh
+      levels: [low, high, xhigh]
+",
+        )
+        .unwrap();
+        let p = &c.models["gpt-4"];
+        assert_eq!(
+            p.reasoning_levels,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+            ]
+        );
+        assert_eq!(p.default_reasoning_level, ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn test_reasoning_empty_levels_falls_back_to_default() {
+        let c = parse(
+            "
+models:
+  gpt-4:
+    provider:
+      base-url: https://api.deepseek.com
+      api-key: sk-abc
+    reasoning:
+      levels: []
+",
+        )
+        .unwrap();
+        let p = &c.models["gpt-4"];
+        assert_eq!(p.reasoning_levels, default_reasoning_levels());
+        assert_eq!(p.default_reasoning_level, ReasoningEffort::Medium);
     }
 
     #[test]

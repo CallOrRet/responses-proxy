@@ -17,6 +17,9 @@ models:
   codex-auto-review:
     model: deepseek-v4-flash
     rewrite: deepseek
+    # Set false if the upstream rejects `stream: true` + structured
+    # `response_format`; the proxy then buffers non-streamed and replays as SSE.
+    # stream-structured-output: true
     provider:
       api-key: $DEEPSEEK_API_KEY
       base-url: https://api.deepseek.com

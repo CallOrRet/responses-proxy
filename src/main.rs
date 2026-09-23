@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -8,9 +8,12 @@ use axum::{
 };
 use clap::Parser;
 use responses_proxy::app;
+use responses_proxy::catalog;
 use responses_proxy::config;
 use responses_proxy::handlers;
+use std::collections::HashMap;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
@@ -91,6 +94,15 @@ async fn main() {
             post(handlers::cancel).route_layer(auth.clone()),
         )
         .layer(cors)
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .zstd(true)
+                .deflate(true),
+        )
+        // Innermost so the limit applies to the decompressed body the extractor buffers.
+        .layer(DefaultBodyLimit::max(state.config().max_body_bytes))
         .with_state(state.clone());
 
     tracing::info!("Listening on {}", listen);
@@ -108,7 +120,15 @@ async fn health_check() -> &'static str {
 
 async fn list_models(
     State(state): State<app::State>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Codex appends `?client_version=...` and reads its context window from a
+    // proprietary `{"models":[...]}` schema; plain OpenAI clients get the
+    // standard `{"object":"list","data":[...]}` shape.
+    if params.contains_key("client_version") {
+        return Ok(Json(codex_model_list(&state).await));
+    }
+
     let data: Vec<serde_json::Value> = state
         .config()
         .models
@@ -120,4 +140,18 @@ async fn list_models(
         })
         .collect();
     Ok(Json(serde_json::json!({"object": "list", "data": data})))
+}
+
+/// Build Codex's proprietary model-list response. Codex ignores the OpenAI
+/// shape, so this mirrors its `ModelsResponse`/`ModelInfo` schema and carries
+/// the per-model `context_window` (config override → upstream value → null,
+/// where null lets Codex fall back to its bundled default). Every required
+/// field must be present or Codex silently discards the entry.
+async fn codex_model_list(state: &app::State) -> serde_json::Value {
+    let mut models = Vec::new();
+    for (name, provider) in &state.config().models {
+        let context_window = state.resolve_context_window(provider).await;
+        models.push(catalog::codex_model_entry(name, provider, context_window));
+    }
+    serde_json::json!({ "models": models })
 }

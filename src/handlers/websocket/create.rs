@@ -22,8 +22,18 @@ fn ws_response(rid: &str, model: &str, now: i64, status: ResponseStatus) -> Resp
     }
 }
 
-/// Handle a `response.create` event: parse, forward to upstream, stream back results.
-pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mut req: Request) {
+/// Handle a `response.create` event: parse, forward to upstream, stream back
+/// results. Returns any WS messages that arrived mid-stream and were buffered
+/// instead of being discarded (see `run_stream`) — the caller must feed these
+/// back into its dispatch loop instead of reading fresh ones off the socket,
+/// so nothing sent concurrently (e.g. a sub-agent's task in multi-agent mode)
+/// is lost.
+pub(super) async fn handle(
+    state: &crate::app::State,
+    socket: &mut WebSocket,
+    mut req: Request,
+    ns: &str,
+) -> Vec<WsMsg> {
     tracing::debug!("input items {}", req.input.len());
 
     let provider = match state.config().models.get(&req.model) {
@@ -36,7 +46,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                 format!("Unknown model: {}", req.model),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
 
@@ -51,7 +61,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
         if let Err(message) =
@@ -64,7 +74,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                 message,
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
         req = match serde_json::from_value(body) {
             Ok(req) => req,
@@ -76,7 +86,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
     }
@@ -90,15 +100,45 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         .iter()
         .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
     {
-        handle_compaction_trigger(state, &provider, socket, req).await;
-        return;
+        handle_compaction_trigger(state, &provider, socket, req, ns).await;
+        return Vec::new();
     }
 
     let model = req.model.clone();
     let generate = req.generate;
 
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let rid = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+
+    // gpt-5.6 code-mode: names Codex declared as custom tools (computed before
+    // `req` is moved), so streamed function calls can be re-emitted as
+    // custom_tool_call. Restored from the previous response on a continuation
+    // turn. Empty for models below 5.6 → no behavior change.
+    let custom_names = crate::convert::resolve_custom_tool_names(
+        state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
+    // Cache alongside the tools so the next continuation restores it too.
+    let stored_custom_names = custom_names.clone();
+    // Tool name → namespace name for tools declared inside a Codex `namespace`
+    // bundle (e.g. `spawn_agent` → `"collaboration"`), needed to restore the tag
+    // Chat Completions can't carry on the wire. Empty whenever Codex's own
+    // multi-agent feature flags are off, so this never changes behavior for
+    // sessions that don't use namespace tools.
+    let tool_namespaces = crate::convert::resolve_tool_namespaces(
+        state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
+    let stored_tool_namespaces = tool_namespaces.clone();
 
     // Convert to Chat API (responses_to_chat handles history + instructions)
     let mut chat_req = match responses_to_chat(req, state).await {
@@ -111,11 +151,69 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                 format!("Unsupported features: {}", unsupported.join(", ")),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
     chat_req.model = provider.model.clone();
+    // Content-character size before truncation. When we truncate, the upstream's
+    // real input_tokens is scaled up by full/sent so Codex's auto-compaction
+    // threshold (keyed off server-reported total_tokens) fires on time instead
+    // of being masked by our truncation.
+    let full_chars = crate::handlers::input_tokens::content_chars(&chat_req.messages);
+    let dropped =
+        crate::convert::enforce_message_budget(&mut chat_req.messages, provider.max_input_messages);
+    if dropped > 0 {
+        tracing::info!(
+            max_messages = provider.max_input_messages,
+            dropped_messages = dropped,
+            "Input exceeded history.max-input-messages — dropped oldest turns"
+        );
+    }
+    let mut shrunk = 0;
+    if let Some(max_chars) = provider.max_input_chars {
+        shrunk = crate::convert::enforce_input_budget(&mut chat_req.messages, max_chars);
+        if shrunk > 0 {
+            tracing::info!(
+                max_chars,
+                shrunk_tool_outputs = shrunk,
+                "Input exceeded history.max-input-chars — truncated old tool outputs"
+            );
+        }
+    }
+    let sent_chars = crate::handlers::input_tokens::content_chars(&chat_req.messages);
+    let truncation_scale =
+        (dropped > 0 || shrunk > 0).then_some((full_chars as u64, sent_chars as u64));
+    tracing::info!(
+        model = %model,
+        upstream = %provider.model,
+        messages = chat_req.messages.len(),
+        transport = "ws",
+        truncation_scale = ?truncation_scale,
+        "Forwarding request"
+    );
     let mut full_input_messages = chat_req.messages.clone();
+    // Cap the tool list before caching/forwarding (see the HTTP handler): some
+    // gateways reject requests carrying too many tools, and Codex code mode can
+    // flatten a large MCP/app-tool registry into hundreds of functions.
+    if provider.max_tools > 0
+        && let Some(tools) = chat_req.tools.as_mut()
+    {
+        let dropped =
+            crate::convert::enforce_tool_budget(tools, provider.max_tools, &tool_namespaces);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                max_tools = provider.max_tools,
+                dropped = dropped.len(),
+                names = ?dropped,
+                "Tool list exceeded max-tools — dropped overflow tools"
+            );
+        }
+    }
+    // Cache the code-mode tool registry so tool-result continuations (which
+    // reference this response via `previous_response_id` but omit
+    // `additional_tools`) can restore it instead of reaching the model with no
+    // tools. Empty for models below 5.6 → no-op.
+    let response_tools = chat_req.tools.clone().unwrap_or_default();
 
     // If generate=false, just echo lifecycle events without calling upstream
     if !generate {
@@ -153,13 +251,52 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                         message,
                     );
                     super::send(socket, &ws_err.to_json_string()).await;
-                    return;
+                    return Vec::new();
                 }
             }
         }
 
+        state
+            .store()
+            .put_tools(
+                rid.clone(),
+                response_tools,
+                stored_custom_names,
+                stored_tool_namespaces,
+            )
+            .await;
         state.store().put(rid, full_input_messages).await;
-        return;
+        return Vec::new();
+    }
+
+    // Buffered path for upstreams that can't stream structured output — the same
+    // limitation the HTTP handler works around. When the provider is flagged
+    // `stream-structured-output: false` and this request carries a structured
+    // `response_format`, fetch the reply non-streamed and replay the canonical
+    // lifecycle over the socket.
+    let buffer_structured = matches!(
+        chat_req.response_format,
+        Some(chat::ResponseFormat::JsonSchema(_)) | Some(chat::ResponseFormat::JsonObject(_))
+    ) && !provider.stream_structured_output;
+
+    if buffer_structured {
+        stream_structured_buffered(
+            state,
+            &provider,
+            socket,
+            chat_req,
+            model,
+            rid,
+            full_input_messages,
+            response_tools,
+            stored_custom_names,
+            stored_tool_namespaces,
+            custom_names,
+            tool_namespaces,
+            truncation_scale,
+        )
+        .await;
+        return Vec::new();
     }
 
     let url = format!("{}/chat/completions", provider.base_url);
@@ -186,7 +323,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
         if let Err(message) = crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out) {
@@ -197,7 +334,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                 message,
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
         tracing::debug!(
             "chat request: {}",
@@ -215,7 +352,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                 format!("Upstream error: {e}"),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
 
@@ -231,7 +368,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             ),
         );
         super::send(socket, &ws_err.to_json_string()).await;
-        return;
+        return Vec::new();
     }
 
     // Send lifecycle start events (typed, with sequence_number)
@@ -265,7 +402,7 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
                     message,
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         }
     }
@@ -282,8 +419,11 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
         responses_out: &provider.rewrite.responses_out,
         now,
         compact_key: state.compact_key(),
+        custom_tool_names: custom_names,
+        tool_namespaces,
+        truncation_scale,
     };
-    let (response_msg, cancelled, stream_events) =
+    let (response_msg, cancelled, stream_events, pending) =
         run_stream(socket, stream_resp, stream_context, cancel_rx).await;
     let events = initial_events;
     // stream_events are already sent, just used for counting
@@ -292,7 +432,13 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
     // Clean up cancel token (run_stream already handled the actual cancellation check)
     state.store().unregister_cancel_token(&rid).await;
 
-    // Persist accumulated history
+    // Persist accumulated history so `previous_response_id` chains resolve.
+    // Codex (store:false) replays full history on new user turns but sends
+    // tool-result *deltas* referencing previous_response_id after a
+    // function_call — without the stored assistant tool_calls message those
+    // deltas would orphan the tool result and the upstream would 400. The
+    // client `store` flag governs client-side GET retrieval, not this internal
+    // chaining, so persist regardless of it.
     if !cancelled {
         // Append assistant response to input messages and store
         let assistant_msg: MessageRequest = response_msg.into();
@@ -305,12 +451,27 @@ pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mu
             "WS: storing history"
         );
         full_input_messages.push(assistant_msg);
+        state
+            .store()
+            .put_tools(
+                rid.clone(),
+                response_tools,
+                stored_custom_names,
+                stored_tool_namespaces,
+            )
+            .await;
         state.store().put(rid, full_input_messages).await;
     }
+    pending
 }
 
 /// Relay SSE chunks from upstream to WebSocket, with cancel detection.
-/// Returns (response_message, cancelled, collected_events).
+/// Returns (response_message, cancelled, collected_events, pending). `pending`
+/// holds any WS message received mid-stream that wasn't a cancel frame — e.g.
+/// a `response.create` for another agent on this same connection (multi-agent
+/// mode multiplexes every agent over one WS). It must not be discarded: the
+/// caller hands it back to the outer dispatch loop instead of letting it
+/// vanish, and this stream keeps running to completion undisturbed.
 struct WsStreamContext<'a> {
     rid: &'a str,
     mid: &'a str,
@@ -319,6 +480,9 @@ struct WsStreamContext<'a> {
     responses_out: &'a crate::config::RewriteConfig,
     now: i64,
     compact_key: Option<&'a [u8; 32]>,
+    custom_tool_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
+    truncation_scale: Option<(u64, u64)>,
 }
 
 async fn run_stream(
@@ -326,7 +490,7 @@ async fn run_stream(
     stream_resp: reqwest::Response,
     context: WsStreamContext<'_>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-) -> (chat::ResponseMessage, bool, Vec<StreamEvent>) {
+) -> (chat::ResponseMessage, bool, Vec<StreamEvent>, Vec<WsMsg>) {
     let mut buf = String::new();
     let mut ss = StreamState::new(
         context.rid.to_string(),
@@ -336,9 +500,13 @@ async fn run_stream(
     ss.has_started = true;
     ss.created = context.now;
     ss.compact_key = context.compact_key.copied();
+    ss.custom_tool_names = context.custom_tool_names;
+    ss.tool_namespaces = context.tool_namespaces;
+    ss.truncation_scale = context.truncation_scale;
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
     let mut collected_events: Vec<StreamEvent> = Vec::new();
+    let mut pending: Vec<WsMsg> = Vec::new();
 
     loop {
         tokio::select! {
@@ -376,7 +544,7 @@ async fn run_stream(
                                             collected_events.push(prepared.event);
                                             if socket.send(WsMsg::Text(msg.into())).await.is_err() {
                                                 tracing::info!("WS send failed");
-                                                return (ss.to_response_message(), false, collected_events);
+                                                return (ss.to_response_message(), false, collected_events, pending);
                                             }
                                         }
                                     }
@@ -390,7 +558,7 @@ async fn run_stream(
                                         let msg = ws_err.to_json_string();
                                         tracing::debug!("WS send: {msg}");
                                         let _ = socket.send(WsMsg::Text(msg.into())).await;
-                                        return (ss.to_response_message(), false, collected_events);
+                                        return (ss.to_response_message(), false, collected_events, pending);
                                     }
                                 }
                             }
@@ -408,12 +576,28 @@ async fn run_stream(
                         cancelled = true;
                         break;
                     }
+                    // Any other message (e.g. a `response.create` for another
+                    // agent on this same connection) — buffer it for the outer
+                    // dispatch loop instead of discarding it and aborting this
+                    // still-in-progress stream.
+                    Some(Ok(other)) => {
+                        tracing::debug!(
+                            "WS: buffering message received mid-stream for dispatch after this response completes"
+                        );
+                        pending.push(other);
+                    }
+                    // Socket actually closed or errored — genuinely terminal.
                     _ => break,
                 }
             }
         }
     }
-    (ss.to_response_message(), cancelled, collected_events)
+    (
+        ss.to_response_message(),
+        cancelled,
+        collected_events,
+        pending,
+    )
 }
 
 /// Run the shared compaction helper and emit a four-event lifecycle on the
@@ -425,11 +609,22 @@ async fn handle_compaction_trigger(
     provider: &crate::config::ResolvedProvider,
     socket: &mut WebSocket,
     req: Request,
+    ns: &str,
 ) {
+    // Codex replays the full history in `input` alongside the trigger
+    // (store:false), so the request itself is the summary source.
+    let current_input: Vec<crate::types::item::InputItem> = req
+        .input
+        .iter()
+        .filter(|i| !matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
+        .cloned()
+        .collect();
+    let current_messages = crate::convert::items_to_chat_messages(&current_input, state);
     let (output, usage, created_at) = match crate::handlers::compact::build_compaction_output(
         state,
         provider,
         req.previous_response_id.as_deref(),
+        current_messages,
     )
     .await
     {
@@ -453,7 +648,10 @@ async fn handle_compaction_trigger(
         }
     };
 
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let rid = crate::store::namespaced_id(
+        ns,
+        &format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+    );
     let mut resp = Response {
         id: rid.clone(),
         model: req.model.clone(),
@@ -482,6 +680,13 @@ async fn handle_compaction_trigger(
             return;
         }
     };
+
+    // Compute persisted summary before `resp` is moved into the Completed event.
+    // Persist regardless of req.store so a later previous_response_id resolves.
+    let store_messages = Some(crate::handlers::compaction_output_to_chat_messages(
+        &resp.output,
+        state,
+    ));
 
     let lifecycle = Response {
         status: ResponseStatus::InProgress,
@@ -524,9 +729,145 @@ async fn handle_compaction_trigger(
         }
     }
 
-    if req.store {
-        state.store().put(rid, vec![]).await;
+    if let Some(store_messages) = store_messages {
+        state.store().put(rid, store_messages).await;
     }
+}
+
+/// Send a server-error event over the WebSocket.
+async fn send_ws_error(socket: &mut WebSocket, status: u16, message: String) {
+    let ws_err = websocket::ErrorEvent::new(
+        status,
+        Error::TYPE_SERVER_ERROR,
+        Error::CODE_SERVER_ERROR,
+        message,
+    );
+    super::send(socket, &ws_err.to_json_string()).await;
+}
+
+/// Buffered structured-output path: fetch the reply non-streamed (the upstream
+/// rejects `stream: true` with a structured `response_format`), then replay the
+/// full response as the canonical WebSocket lifecycle. Mirrors the HTTP
+/// `handle_streaming_structured` and reuses `response_to_stream_events`.
+#[allow(clippy::too_many_arguments)]
+async fn stream_structured_buffered(
+    state: &crate::app::State,
+    provider: &crate::config::ResolvedProvider,
+    socket: &mut WebSocket,
+    mut chat_req: chat::Request,
+    model: String,
+    rid: String,
+    mut full_input_messages: Vec<MessageRequest>,
+    response_tools: Vec<chat::ToolRequest>,
+    stored_custom_names: std::collections::HashSet<String>,
+    stored_tool_namespaces: std::collections::HashMap<String, String>,
+    custom_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
+    truncation_scale: Option<(u64, u64)>,
+) {
+    chat_req.stream = Some(false);
+    chat_req.stream_options = None;
+
+    let url = format!("{}/chat/completions", provider.base_url);
+    let request = state
+        .http_client()
+        .post(&url)
+        .timeout(provider.timeout)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .header("Content-Type", "application/json");
+    let request = if provider.rewrite.chat_out.is_empty() {
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&chat_req).unwrap_or_default()
+        );
+        request.json(&chat_req)
+    } else {
+        let mut body = match serde_json::to_value(&chat_req) {
+            Ok(body) => body,
+            Err(e) => return send_ws_error(socket, 500, e.to_string()).await,
+        };
+        if let Err(message) = crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out) {
+            return send_ws_error(socket, 500, message).await;
+        }
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&body).unwrap_or_default()
+        );
+        request.json(&body)
+    };
+
+    let http_resp = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return send_ws_error(socket, 502, format!("Upstream error: {e}")).await,
+    };
+    if !http_resp.status().is_success() {
+        let status = http_resp.status().as_u16();
+        let body = http_resp.text().await.unwrap_or_default();
+        return send_ws_error(socket, status, format!("Upstream error:  {body}")).await;
+    }
+    let body = match http_resp.text().await {
+        Ok(b) => b,
+        Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+    };
+
+    let chat_resp: chat::Completion = if provider.rewrite.chat_in.is_empty() {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        }
+    } else {
+        let mut v: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        };
+        if let Err(message) = crate::rewrite::apply_rewrite(&mut v, &provider.rewrite.chat_in) {
+            return send_ws_error(socket, 500, message).await;
+        }
+        match serde_json::from_value(v) {
+            Ok(v) => v,
+            Err(e) => return send_ws_error(socket, 502, e.to_string()).await,
+        }
+    };
+
+    let mut resp = crate::convert::chat_to_responses(chat_resp, model, state.compact_key());
+    resp.id = rid.clone();
+    crate::handlers::apply_input_char_scale(resp.usage.as_mut(), truncation_scale);
+    crate::convert::apply_tool_namespaces(&mut resp, &tool_namespaces);
+    crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
+
+    // Compute persisted history before `resp` is consumed by event synthesis.
+    let stored_output = crate::convert::items_to_chat_messages(
+        &crate::convert::output_to_input_items(&resp.output),
+        state,
+    );
+
+    for event in crate::handlers::response_to_stream_events(resp) {
+        match prepare_stream_event(event, &provider.rewrite.responses_out) {
+            Ok(prepared) => {
+                let msg = prepared.body.to_string();
+                tracing::debug!("WS send: {msg}");
+                if socket.send(WsMsg::Text(msg.into())).await.is_err() {
+                    tracing::info!("WS send failed");
+                    return;
+                }
+            }
+            Err(message) => return send_ws_error(socket, 500, message).await,
+        }
+    }
+
+    // Persist history so `previous_response_id` chains resolve (see the
+    // streaming path's note); independent of the client `store` flag.
+    full_input_messages.extend(stored_output);
+    state
+        .store()
+        .put_tools(
+            rid.clone(),
+            response_tools,
+            stored_custom_names,
+            stored_tool_namespaces,
+        )
+        .await;
+    state.store().put(rid, full_input_messages).await;
 }
 
 #[cfg(test)]

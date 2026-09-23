@@ -98,6 +98,10 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    /// Codex `gpt-5.6`-class tier above `xhigh`.
+    Max,
+    /// Codex `gpt-5.6`-class tier above `max`.
+    Ultra,
 }
 
 /// Verbosity level for text output.

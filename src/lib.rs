@@ -2,6 +2,7 @@
 //! and proxies them to upstream Chat API providers.
 
 pub mod app;
+pub mod catalog;
 pub mod config;
 pub mod convert;
 pub mod crypto;

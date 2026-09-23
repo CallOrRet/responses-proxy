@@ -101,3 +101,52 @@ async fn store_writes_messages_jsonl_and_recovers_from_disk() {
 
     let _ = tokio::fs::remove_dir_all(dir).await;
 }
+
+#[tokio::test]
+async fn namespaced_ids_isolate_history_and_disk_layout() {
+    use responses_proxy::store::namespaced_id;
+
+    let dir = temp_store_dir();
+    let store = Store::with_dir(dir.clone());
+
+    // Same raw response id minted under two namespaces → distinct keys, so two
+    // parallel Codex instances can't read each other's history.
+    let raw = "resp_deadbeef";
+    let a = namespaced_id("alpha", raw);
+    let b = namespaced_id("beta", raw);
+    assert_ne!(a, b);
+
+    store.put(a.clone(), vec![user_msg("alpha history")]).await;
+    store.put(b.clone(), vec![user_msg("beta history")]).await;
+
+    // Each namespace persists under its own subdirectory.
+    let a_path = dir.join("messages").join("alpha").join("deadbeef.jsonl");
+    let b_path = dir.join("messages").join("beta").join("deadbeef.jsonl");
+    wait_for_path(&a_path).await;
+    wait_for_path(&b_path).await;
+
+    // Recover from a fresh Store (disk-only) and confirm no cross-talk.
+    let recovered = Store::with_dir(dir.clone());
+    assert_eq!(
+        message_text(&recovered.get(&a).await.unwrap()[0]),
+        "alpha history"
+    );
+    assert_eq!(
+        message_text(&recovered.get(&b).await.unwrap()[0]),
+        "beta history"
+    );
+    // The un-namespaced raw id belongs to neither namespace.
+    assert!(recovered.get(raw).await.is_none());
+
+    let _ = tokio::fs::remove_dir_all(dir).await;
+}
+
+#[tokio::test]
+async fn missing_entry_is_a_miss_not_empty_history() {
+    // A genuine cache miss must be None, not Some(vec![]) — otherwise a lost
+    // history would masquerade as an empty (but valid) conversation.
+    let dir = temp_store_dir();
+    let store = Store::with_dir(dir.clone());
+    assert!(store.get("resp_never_written").await.is_none());
+    let _ = tokio::fs::remove_dir_all(dir).await;
+}

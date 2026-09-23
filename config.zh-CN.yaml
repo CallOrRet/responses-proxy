@@ -152,6 +152,9 @@ models:
   codex-auto-review:
     # 示例：暴露另一个逻辑模型，但使用同一 provider 里的另一个下游模型。
     model: deepseek-v4-flash
+    # 若上游对 `stream: true` + 结构化 `response_format` 返回 500，设为 false，
+    # 代理会以非流式获取响应再作为 SSE 回放。默认 true（原样透传流式）。
+    # stream-structured-output: true
     provider:
       api-key: $DEEPSEEK_API_KEY
       base-url: https://api.deepseek.com

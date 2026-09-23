@@ -166,6 +166,13 @@ async fn spawn_proxy(chat_base_url: String) -> String {
             model: "mock-chat-model".into(),
             timeout: Duration::from_secs(10),
             rewrite: Default::default(),
+            max_input_chars: None,
+            max_input_messages: 1000,
+            max_tools: 0,
+            stream_structured_output: true,
+            context_window: None,
+            reasoning_levels: vec![responses_proxy::types::ReasoningEffort::Medium],
+            default_reasoning_level: responses_proxy::types::ReasoningEffort::Medium,
         },
     );
 
@@ -179,6 +186,7 @@ async fn spawn_proxy(chat_base_url: String) -> String {
         model_names: vec!["gpt-proxy-test".into()],
         models,
         compact_encryption_key: String::new(),
+        max_body_bytes: 100 * 1024 * 1024,
     });
 
     let app = Router::new()
@@ -559,4 +567,87 @@ async fn post_response(
         .json::<responses::Response>()
         .await
         .unwrap()
+}
+
+fn compaction_trigger() -> InputItem {
+    InputItem::CompactionTrigger(responses_proxy::types::item::CompactionTrigger::default())
+}
+
+/// B0 regression: Codex sends `compaction_trigger` with the full history inline
+/// in `input` (store:false). The proxy must summarize that inline history — not
+/// the empty server-side store — so the upstream summary request must contain
+/// the replayed conversation, not just the summary prompt.
+#[tokio::test]
+async fn compaction_trigger_summarizes_inline_input_history() {
+    let (chat_base_url, seen_chat_requests) = spawn_mock_chat_api().await;
+    let proxy_base_url = spawn_proxy(chat_base_url).await;
+    let client = reqwest::Client::new();
+
+    let req = responses::Request {
+        model: "gpt-proxy-test".into(),
+        // No previous_response_id — history lives entirely in `input`.
+        input: vec![
+            user_text("first user turn"),
+            user_text("second user turn"),
+            compaction_trigger(),
+        ],
+        ..Default::default()
+    };
+    let resp = client
+        .post(format!("{proxy_base_url}/v1/responses"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<responses::Response>()
+        .await
+        .unwrap();
+
+    // Response carries exactly one compaction output item.
+    assert_eq!(resp.output.len(), 1);
+    assert!(matches!(
+        resp.output[0],
+        responses_proxy::types::item::OutputItem::Compaction(_)
+    ));
+
+    // The upstream summary request must include the inline history followed by
+    // the summary prompt — proving B0 reads `input`, not the empty store.
+    let seen = seen_chat_requests.lock().await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "compaction should make exactly one upstream call"
+    );
+    let summary_req = &seen[0];
+    assert!(
+        summary_req.messages.len() >= 3,
+        "expected inline history + summary prompt, got {} messages",
+        summary_req.messages.len()
+    );
+    assert_user_message(&summary_req.messages[0], "first user turn");
+    assert_user_message(&summary_req.messages[1], "second user turn");
+    // Last message is the summary prompt (a user message; content may be Parts).
+    let last = summary_req.messages.last().unwrap();
+    match last {
+        chat::MessageRequest::User(m) => {
+            let text = match &m.content {
+                chat::UserContent::Text(t) => t.clone(),
+                chat::UserContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        chat::ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            };
+            assert!(
+                text.contains("summary") || text.contains("<summary>"),
+                "last message should be the summary prompt"
+            );
+        }
+        other => panic!("expected summary-prompt user message, got {other:?}"),
+    }
 }

@@ -92,7 +92,9 @@ models:
     # - replace: if current value matches "if", write set to the current
     #   replace key, then write each optional with entry
     #   With is an ordered map of target path -> JSON value. Use "" as a
-    #   with key to replace the whole body.
+    #   with key to replace the whole body. A with entry can target any path,
+    #   including "model", so a single rule can both clamp a field and route the
+    #   request to a different upstream model (see the reasoning example below).
     #   String "if" values are regex patterns. Use ^...$ for exact matches.
     #
     # The commented example below shows common provider compatibility rewrites.
@@ -112,6 +114,9 @@ models:
     #         - if: "^(high|xhigh)$"
     #           set: max
     #           with:
+    #             # Route the highest reasoning tiers to a stronger upstream
+    #             # model in the same rule that clamps the effort value.
+    #             model: provider/model-pro
     #             thinking:
     #               type: enable
     #         - if: "^(minimal|low|medium)$"
@@ -151,10 +156,59 @@ models:
       # Optional. Falls back to server.timeout.
       timeout: 60
 
+    # Per-model history controls.
+    # Optional. Omit the whole block to accept the defaults.
+    history:
+      # Total character ceiling for the converted Chat request. When replayed
+      # history exceeds it, the oldest tool outputs are truncated until it fits.
+      # Acts as a backstop; keep it above the compaction point (see
+      # context-window) so Codex compacts before the proxy has to truncate.
+      # Optional. Default: unlimited.
+      # max-input-chars: 1500000
+
+      # Maximum number of messages in the converted Chat request.
+      # Optional. Default: 1000.
+      # max-input-messages: 1000
+
+      # Context window (tokens) advertised to Codex via /v1/models. Codex keys
+      # its client-side auto-compaction off this size (it compacts at ~90% of
+      # it). Setting this OVERRIDES whatever the upstream advertises; leaving it
+      # unset trusts the upstream's own context length, and if the upstream
+      # doesn't report one, Codex falls back to its bundled default.
+      # Optional. Default: trust the upstream.
+      # context-window: 400000
+
+    # Reasoning tiers advertised to Codex via /v1/models. Codex builds its
+    # `/model` picker verbatim from this ordered list (recent versions no longer
+    # infer the other built-in tiers themselves), so a model that advertises only
+    # one tier shows only that tier. The order given here is the order shown.
+    # Omit this block to advertise the built-in default:
+    #   levels:  low, medium, high, xhigh, max, ultra
+    #   default: medium
+    #
+    # WARNING: that default list includes xhigh/max/ultra. A plain Chat
+    # Completions upstream rejects tiers it does not support (max/ultra typically
+    # exist only on a provider's /v1/messages endpoint). If yours does not accept
+    # them, either narrow "levels" to what it supports, or clamp max/ultra down
+    # with a rewrite (see the reasoning_effort example above).
+    # reasoning:
+    #   # Tier the picker selects by default.
+    #   default: medium
+    #   # Ordered tiers to advertise; order is preserved in the picker.
+    #   levels:
+    #     - low
+    #     - medium
+    #     - high
+    #     - xhigh
+
   codex-auto-review:
     # Example of exposing another logical model backed by a different
     # downstream model on the same provider.
     model: deepseek-v4-flash
+    # If the upstream 500s on `stream: true` + a structured `response_format`,
+    # set this to false and the proxy buffers a non-streamed reply and replays
+    # it as SSE. Defaults to true (stream through unchanged).
+    # stream-structured-output: true
     provider:
       api-key: $DEEPSEEK_API_KEY
       base-url: https://api.deepseek.com

@@ -26,6 +26,65 @@ codex        # 使用 gpt-5.5 模型
 codex review # 使用 codex-auto-review 模型（如已配置）
 ```
 
+### 独立 profile（按会话切换后端）
+
+`openai_base_url` 是全局设置。如果想按会话在代理与其他后端之间切换，可以定义一个
+provider，并用 `codex --profile <name>` 选择对应 profile。
+
+在 `~/.codex/config.toml` 中声明 provider：
+
+```toml
+[model_providers.responses_proxy]
+name = "responses-proxy (local)"
+base_url = "http://localhost:3000/v1"
+# wire_api 默认为 "responses"（正是代理所说的协议）；除非在 config.yaml 中启用
+# server.auth.keys，否则无需 env_key。
+```
+
+> **子代理（`features.multi_agent` / `features.multi_agent_v2`）**是 Codex
+> 本地的 `Experimental`（实验性）功能：由 Codex 自身的客户端线程管理器驱动，
+> 会在本地派生一个子代理线程，并为该线程单独发起一次上游 Chat Completions
+> 调用。代理（proxy）并不参与编排这一切——它只是像转发其他工具一样，原样转发
+> `spawn_agent`/`send_message`/… 这些工具定义与调用，并恢复 Chat Completions
+> 协议本身不携带的 `namespace` 标记，好让 Codex 自身按 `(name, namespace)`
+> 路由调用时能够识别，而不是拒绝为 `unsupported call`。启用这些开关意味着你在
+> 使用上游的实验性行为，其表现可能独立于本代理发生变化甚至失效。
+>
+> **如果子代理出现问题，把开关关掉即可**——这是 Codex 一侧的设置，本代理并不
+> 控制它：
+> ```toml
+> [features]
+> multi_agent = false
+>
+> [features.multi_agent_v2]
+> enabled = false
+> ```
+> 两者都关闭后，Codex 就不会再下发 `collaboration` 工具集，代理的 namespace
+> 处理逻辑自然变成空操作——不影响其他任何行为。
+
+Codex ≥ 0.134 不再读取内联的 `[profiles.<name>]` 表——请把 profile 放到独立的
+overlay 文件 `~/.codex/<name>.config.toml` 中，使用顶层键（其余设置，包括
+`[model_providers.*]`，都从基础配置继承）。创建 `~/.codex/proxy.config.toml`：
+
+```toml
+model = "gpt-5.6-sol"          # 必须与 config.yaml 中的某个模型键一致
+model_provider = "responses_proxy"
+model_reasoning_effort = "high"
+```
+
+```bash
+codex --profile proxy
+```
+
+> **在会话开始时选定后端——不要在会话中途切换 provider。** 回放的历史携带
+> backend-specific 的 item id，将进行中的会话切换到其他后端会触发 id 前缀拒绝。
+> 在同一 provider 内切换模型（`/model`）则是安全的。
+
+> **多个并行实例**已经通过各自唯一的 response id 天然隔离。若仍想严格隔离缓存，可
+> 通过 `[model_providers.<id>].http_headers = { "x-responses-proxy-namespace" = "alpha" }`
+> 为每个实例设置可选的 `x-responses-proxy-namespace` 头——不同 namespace 使用各自
+> 独立的存储。常规使用无需配置。
+
 ## 工作原理
 
 ```
@@ -105,6 +164,9 @@ models:
       base-url: https://api.deepseek.com
       api-key: $DEEPSEEK_API_KEY
     model: deepseek-v4-flash
+    # 若上游拒绝 `stream: true` 与结构化 `response_format` 组合，设为 false；
+    # 代理会以非流式方式获取响应，再作为 SSE 回放给客户端。默认 true（原样透传流式）。
+    # stream-structured-output: true
 ```
 
 ### Rewrite 规则
@@ -214,6 +276,8 @@ rewrites:
 ## 流式传输
 
 在 Responses API 请求中设置 `"stream": true`。代理会将 Chat API SSE 数据块转换为 Responses API 流式事件（`response.created` → `response.output_text.delta` → `response.completed`）。Tool call 增量数据跨 chunk 累积后在最终事件中完整输出。
+
+**结构化输出的流式传输。** 部分网关会拒绝 `stream: true` 与结构化 `response_format`（`json_schema` / `json_object`）的组合——Codex 的 Guardian 审查正是这种请求。为受影响的模型设置 `stream-structured-output: false`，代理便会以非流式方式获取该响应，再作为单次 SSE 回放给客户端（`response.created` → `response.output_text.delta` → `response.completed`）。对客户端完全透明，而结构化输出本就无法利用流式增量（不完整的 JSON 无法解析）。默认值为 `true`，因此原生支持结构化流式输出的提供方（如 OpenAI）不受影响。
 
 ## 鉴权
 

@@ -51,6 +51,58 @@ models:
       base-url: $GATEWAY_BASE_URL
       timeout: 300
 
+  # gpt-5.6 emits reasoning tiers above "xhigh" ("max"/"ultra"). Chat
+  # Completions gateways top out at "xhigh" ("max"/"ultra" are /v1/messages-
+  # only), so this model uses the extended profile that clamps them down.
+  gpt-5.6:
+    model: openai/gpt-5.6
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  # gpt-6-astra does not support the "none" reasoning effort (reasoning is
+  # mandatory), and like gpt-5.6 it emits "max"/"ultra" tiers that Chat
+  # Completions gateways cap at "xhigh" — so it reuses the clamping profile.
+  # Its tool calling works over Chat Completions through this proxy even though
+  # the model's native contract is Responses-only.
+  gpt-6-astra:
+    model: openai/gpt-6-astra
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  gpt-6-sol:
+    model: openai/gpt-6-sol
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  gpt-6-luna:
+    model: openai/gpt-6-luna
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  # Some apps request "gpt-reserve" as an application-level fallback alias
+  # when their configured model is unavailable ("Unknown model: gpt-reserve").
+  # This is not a real upstream model — point it at whichever configured
+  # model should serve as the fallback target; gpt-5.6-luna here.
+  gpt-reserve:
+    model: openai/gpt-5.6-luna
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
   codex-auto-review:
     model: openai/gpt-5.5
     rewrite: openai-gateway
@@ -92,6 +144,35 @@ rewrites:
     # Note: rename does not expand wildcards (only remove/replace/reset do),
     # so choices[0] is hard-coded — Chat Completions only ever has one
     # choice in this proxy's flow.
+    - at: chat-in
+      rename:
+        choices.0.message.reasoning: choices.0.message.reasoning_content
+        choices.0.delta.reasoning: choices.0.delta.reasoning_content
+      remove:
+        - choices.*.message.reasoning_details
+        - choices.*.delta.reasoning_details
+
+  # Extended profile for gpt-5.6: identical to `openai-gateway`, plus a clamp
+  # of the reasoning tiers above "xhigh". gpt-5.6 emits reasoning_effort
+  # "max"/"ultra", but Chat Completions caps at "xhigh" ("max"/"ultra" are
+  # /v1/messages-only), so the gateway 400s with feature_not_supported unless
+  # we downgrade them here.
+  openai-gateway-5.6:
+    - at: response-in
+      replace:
+        input.*.content.*.type:
+          - if: "^output_text$"
+            set: input_text
+
+    - at: chat-out
+      replace:
+        messages.*.role:
+          - if: "^developer$"
+            set: system
+        reasoning_effort:
+          - if: "^(max|ultra)$"
+            set: xhigh
+
     - at: chat-in
       rename:
         choices.0.message.reasoning: choices.0.message.reasoning_content

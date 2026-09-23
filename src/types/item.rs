@@ -2,8 +2,8 @@
 //!
 //! ## Tagged unions
 //!
-//! - `InputItem` and `OutputItem` have an `Unknown(serde_json::Value)` catch-all
-//!   variant for forward compatibility.
+//! - `InputItem`, `OutputItem`, and `AgentMessageContent` have an
+//!   `Unknown(serde_json::Value)` catch-all variant for forward compatibility.
 //! - `InputContentBlock`, `OutputContentBlock`, and `OutputAnnotation` use
 //!   derive-based serde tagged on `type`.
 
@@ -603,6 +603,54 @@ pub struct Compaction {
     pub created_by: Option<String>,
 }
 
+/// Context-compaction item — the third compaction shape in the Codex wire
+/// format (alongside `Compaction` and `CompactionTrigger`). Carries an optional
+/// encrypted summary of dropped context. Codex replays it every turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextCompaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
+}
+
+/// Content block within an [`AgentMessage`] item. Has an `Unknown` catch-all
+/// (mirroring `InputItem`/`OutputItem`, see the module doc comment) so a
+/// content-block shape this proxy doesn't recognize fails just that one
+/// block instead of the whole `AgentMessage` — and therefore the whole
+/// request — being rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageContent {
+    InputText {
+        text: String,
+    },
+    EncryptedContent {
+        encrypted_content: String,
+    },
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+/// Inter-agent communication item. Multi-agent mode (the `collaboration`
+/// namespace: `spawn_agent`, `send_message`, `followup_task`, ...) delivers
+/// task assignments and messages between the root agent and its sub-agents
+/// as this item type rather than a plain `message`, so it can carry routing
+/// (`author`/`recipient` agent paths). Codex replays it as history on the
+/// receiving agent's own turns — this is how a sub-agent actually learns
+/// what task it was given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub author: String,
+    pub recipient: String,
+    #[serde(default)]
+    pub content: Vec<AgentMessageContent>,
+}
+
 /// Computer call.  Doc §3.9.f.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -899,12 +947,30 @@ pub struct WebSearchCall {
     pub status: String,
 }
 
+/// `additional_tools` input item — Codex (gpt-5.6+) delivers tool definitions
+/// mid-conversation as an input item (role `developer`) instead of the
+/// top-level `tools` array. Its entries use the code-mode protocol
+/// (`custom`/`namespace`), which Chat Completions does not accept, so the
+/// converter flattens them into plain `function` tools.
+///
+/// `tools` is kept as raw `Value` on purpose: an unrecognized tool type must
+/// not fail the whole request parse — each entry is decoded individually in
+/// the converter and skipped if unknown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdditionalTools {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<serde_json::Value>,
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ── Tagged Enum: InputItem ──────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Input item union type — elements of the `input` array in API requests.
-/// Dispatched by `type` field.  27 variants + Unknown catch-all.
+/// Dispatched by `type` field.  29 variants + Unknown catch-all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputItem {
@@ -926,6 +992,8 @@ pub enum InputItem {
     Reasoning(Reasoning),
     Compaction(Compaction),
     CompactionTrigger(CompactionTrigger),
+    ContextCompaction(ContextCompaction),
+    AgentMessage(AgentMessage),
     LocalShellCall(LocalShellCall),
     LocalShellCallOutput(LocalShellCallOutput),
     ShellCall(ShellCall),
@@ -935,6 +1003,7 @@ pub enum InputItem {
     ToolSearchCall(ToolSearchCall),
     ToolSearchOutput(ToolSearchOutput),
     ItemReference(ItemReference),
+    AdditionalTools(AdditionalTools),
     #[serde(untagged)]
     Unknown(serde_json::Value),
 }
@@ -1129,7 +1198,43 @@ mod tests {
             _ => panic!("expected CompactionTrigger variant, got {item:?}"),
         }
         let roundtripped = serde_json::to_value(&item).unwrap();
-        assert_eq!(roundtripped, serde_json::json!({ "type": "compaction_trigger" }));
+        assert_eq!(
+            roundtripped,
+            serde_json::json!({ "type": "compaction_trigger" })
+        );
+    }
+
+    #[test]
+    fn input_item_context_compaction_roundtrip() {
+        let json = serde_json::json!({
+            "type": "context_compaction",
+            "encrypted_content": "ENC",
+        });
+        let item: InputItem = serde_json::from_value(json.clone()).unwrap();
+        match &item {
+            InputItem::ContextCompaction(c) => {
+                assert_eq!(c.encrypted_content.as_deref(), Some("ENC"));
+            }
+            _ => panic!("expected ContextCompaction variant, got {item:?}"),
+        }
+        assert_eq!(serde_json::to_value(&item).unwrap(), json);
+    }
+
+    #[test]
+    fn input_item_image_generation_call_not_unknown() {
+        // Codex replays image_generation_call items every turn; they must
+        // deserialize into the typed variant, not the Unknown catch-all.
+        let json = serde_json::json!({
+            "type": "image_generation_call",
+            "id": "ig_1",
+            "status": "completed",
+            "result": "BASE64DATA",
+        });
+        let item: InputItem = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(item, InputItem::ImageGenerationCall(_)),
+            "expected ImageGenerationCall, got {item:?}"
+        );
     }
 
     #[test]

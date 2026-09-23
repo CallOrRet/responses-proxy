@@ -24,6 +24,7 @@ use super::event;
 pub use super::event::StreamEvent;
 use super::item::{self, OutputContentBlock, OutputItem, ReasoningTextPart};
 use super::responses::{Response, ResponseStatus};
+use std::collections::{HashMap, HashSet};
 
 // ── Streaming accumulator ────────────────────────────────────────────────
 
@@ -54,6 +55,29 @@ pub struct StreamState {
     /// If set, reasoning content is encrypted into `encrypted_content`
     /// instead of being stored as plain `content`.
     pub compact_key: Option<[u8; 32]>,
+    /// Tool names Codex declared as `custom` (code-mode). Upstream returns them
+    /// as `function` calls; for these names the client-facing events are emitted
+    /// as `custom_tool_call` instead (see [`emit_tool_call_deltas`]).
+    pub custom_tool_names: HashSet<String>,
+    /// Tool name → namespace name for tools declared inside a Codex `namespace`
+    /// bundle (e.g. `spawn_agent` → `"collaboration"`). Chat Completions carries
+    /// no namespace field, so this is threaded separately and re-attached to
+    /// the `function_call`/`custom_tool_call` events emitted for these names
+    /// (see [`emit_tool_call_deltas`]) — otherwise Codex's `(name, namespace)`-
+    /// keyed registry rejects the call as `"unsupported call: <name>"`. Empty
+    /// whenever the turn declared no `namespace` tools, e.g. when Codex's own
+    /// multi-agent feature flags are off.
+    pub tool_namespaces: HashMap<String, String>,
+    /// Truncation char-scale `(full_chars, sent_chars)` applied to the reported
+    /// `usage` before it reaches Codex. Codex gates auto-compaction on the
+    /// reported `total_tokens`, so when history is truncated we scale the count
+    /// back up to the true pre-truncation size. `None` leaves usage untouched.
+    /// See `handlers::apply_input_char_scale`.
+    pub(crate) truncation_scale: Option<(u64, u64)>,
+    /// Set when a chunk carries an upstream `error` (e.g. a provider outage
+    /// reported mid-stream). Once set, [`build_completion_events`] emits
+    /// `response.failed` instead of treating the turn as completed.
+    pub error: Option<chat::ChatError>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,6 +88,10 @@ pub struct ToolCallAccumulator {
     pub index: i64,
     pub fc_id: String,
     pub output_index: i64,
+    /// True when this tool name is in [`StreamState::custom_tool_names`].
+    pub is_custom: bool,
+    /// Namespace name if this tool name is in [`StreamState::tool_namespaces`].
+    pub namespace: Option<String>,
 }
 
 impl StreamState {
@@ -113,6 +141,25 @@ impl StreamState {
         parts.join("\n")
     }
 
+    /// Recover assistant message text/refusal closed mid-stream. A text→tool_calls
+    /// transition pushes the message into `completed_items` and clears
+    /// `accumulated_text`; mirror the reasoning/tool_call recovery so persisted
+    /// history keeps the assistant's preamble instead of dropping it.
+    fn extract_message_from_completed(&self) -> (String, String) {
+        let (mut text, mut refusal) = (String::new(), String::new());
+        for item in &self.completed_items {
+            if let OutputItem::Message(m) = item {
+                for block in &m.content {
+                    match block {
+                        OutputContentBlock::Text { text: t, .. } => text.push_str(t),
+                        OutputContentBlock::Refusal { refusal: r } => refusal.push_str(r),
+                    }
+                }
+            }
+        }
+        (text, refusal)
+    }
+
     fn extract_tool_calls_from_completed(completed: &[OutputItem]) -> Vec<chat::ToolCallResponse> {
         completed
             .iter()
@@ -137,13 +184,14 @@ impl StreamState {
     }
 
     pub fn to_response_message(&self) -> chat::ResponseMessage {
-        let (content, refusal) = if self.has_refusal {
-            (None, Some(self.accumulated_text.clone()))
-        } else if self.accumulated_text.is_empty() {
-            (None, None)
+        let (mut text, mut refusal) = self.extract_message_from_completed();
+        if self.has_refusal {
+            refusal.push_str(&self.accumulated_text);
         } else {
-            (Some(self.accumulated_text.clone()), None)
-        };
+            text.push_str(&self.accumulated_text);
+        }
+        let content = (!text.is_empty()).then_some(text);
+        let refusal = (!refusal.is_empty()).then_some(refusal);
         // Gather tool calls: open ones + any closed mid-stream
         let mut tool_calls: Vec<chat::ToolCallResponse> = Vec::new();
         for tc in &self.tool_calls {
@@ -247,11 +295,20 @@ pub fn process_chunk_value(
         state.created = chunk.created;
     }
 
-    // Usage-only chunk (choices empty, usage present) — store usage, no events
+    if chunk.error.is_some() {
+        state.error = chunk.error;
+    }
+
+    // Capture usage whenever the provider includes it. The OpenAI reference
+    // sends it on a separate choices-empty chunk, but some providers attach it
+    // to the final chunk that still carries a finish_reason choice — reading it
+    // only on the choices-empty path would silently drop it there.
+    if let Some(ref usage) = chunk.usage {
+        state.usage = Some(usage.clone());
+    }
+
+    // Usage-only chunk (no choices) — nothing further to emit.
     if chunk.choices.is_empty() {
-        if let Some(ref usage) = chunk.usage {
-            state.usage = Some(usage.clone());
-        }
         return None;
     }
 
@@ -462,43 +519,114 @@ fn close_reasoning_item(state: &mut StreamState) -> Vec<StreamEvent> {
     events
 }
 
+/// Extract the freeform `input` from the `{ "input": "..." }` wrapper we present
+/// custom (code-mode) tools with. Falls back to the raw string if it is not the
+/// expected JSON shape.
+pub fn unwrap_custom_input(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| v.get("input")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent> {
-    // Capture seq before borrowing tool_calls (avoids borrow conflict)
-    let seq1 = next_seq(state);
-    let seq2 = next_seq(state);
-
-    let tc = &state.tool_calls[idx];
-    let mut events = Vec::new();
-
-    let fc_id = if tc.fc_id.is_empty() {
-        format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
-    } else {
-        tc.fc_id.clone()
+    // Copy the fields we need in a scoped borrow so the mutable `next_seq` /
+    // `completed_items` calls below don't conflict with the tool_calls borrow.
+    let (id, name, arguments, output_index, fc_id_raw, is_custom, namespace) = {
+        let tc = &state.tool_calls[idx];
+        (
+            tc.id.clone(),
+            tc.name.clone(),
+            tc.arguments.clone(),
+            tc.output_index,
+            tc.fc_id.clone(),
+            tc.is_custom,
+            tc.namespace.clone(),
+        )
     };
+    let mut events = Vec::new();
+    let item_id = if fc_id_raw.is_empty() {
+        let prefix = if is_custom { "ctc" } else { "fc" };
+        format!(
+            "{}_{}",
+            prefix,
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        )
+    } else {
+        fc_id_raw
+    };
+
+    if is_custom {
+        // Codex expects a custom_tool_call for these. Per-chunk deltas were
+        // suppressed (they carried the JSON `{ input }` wrapper), so emit the
+        // unwrapped freeform input once as delta + done.
+        let input = unwrap_custom_input(&arguments);
+        events.push(StreamEvent::CustomToolCallInputDelta(
+            event::CustomToolCallInputDelta {
+                delta: input.clone(),
+                item_id: item_id.clone(),
+                output_index,
+                sequence_number: next_seq(state),
+            },
+        ));
+        events.push(StreamEvent::CustomToolCallInputDone(
+            event::CustomToolCallInputDone {
+                input: input.clone(),
+                item_id: item_id.clone(),
+                output_index,
+                sequence_number: next_seq(state),
+            },
+        ));
+        events.push(StreamEvent::OutputItemDone(event::OutputItemDone {
+            output_index,
+            item: OutputItem::CustomToolCall(item::CustomToolCall {
+                call_id: id.clone(),
+                input,
+                name: name.clone(),
+                id: Some(item_id),
+                namespace: namespace.clone(),
+            }),
+            sequence_number: next_seq(state),
+        }));
+        // Keep the function-shaped call in completed_items so the stored/replayed
+        // assistant message stays function-typed (the upstream only accepts
+        // function tools).
+        state
+            .completed_items
+            .push(OutputItem::FunctionCall(item::FunctionCall {
+                call_id: id,
+                name,
+                arguments,
+                id: None,
+                namespace,
+                status: Some("completed".into()),
+            }));
+        return events;
+    }
 
     // function_call_arguments.done
     events.push(StreamEvent::FunctionCallArgumentsDone(
         event::FunctionCallArgumentsDone {
-            arguments: tc.arguments.clone(),
-            item_id: fc_id.clone(),
-            output_index: tc.output_index,
-            sequence_number: seq1,
+            arguments: arguments.clone(),
+            item_id: item_id.clone(),
+            output_index,
+            sequence_number: next_seq(state),
         },
     ));
 
     // output_item.done
     let fc_item = OutputItem::FunctionCall(item::FunctionCall {
-        call_id: tc.id.clone(),
-        name: tc.name.clone(),
-        arguments: tc.arguments.clone(),
-        id: Some(fc_id),
-        namespace: None,
+        call_id: id,
+        name,
+        arguments,
+        id: Some(item_id),
+        namespace,
         status: Some("completed".into()),
     });
     events.push(StreamEvent::OutputItemDone(event::OutputItemDone {
-        output_index: tc.output_index,
+        output_index,
         item: fc_item.clone(),
-        sequence_number: seq2,
+        sequence_number: next_seq(state),
     }));
     state.completed_items.push(fc_item);
 
@@ -632,92 +760,73 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
         events.extend(close_message_item(state));
     }
 
-    // Collect output items — mid-stream closed items + any still in progress
-    let mut output_items: Vec<OutputItem> = state.completed_items.clone();
-
-    if !state.reasoning_content.is_empty() {
-        output_items.push(OutputItem::Reasoning(build_reasoning_item(
-            state.reasoning_id.clone(),
-            &state.reasoning_content,
-            state.compact_key.as_ref(),
-        )));
-    }
-
-    for tc in &state.tool_calls {
-        if tc.id.is_empty() {
-            continue;
-        }
-        let fc_id = if tc.fc_id.is_empty() {
-            format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
-        } else {
-            tc.fc_id.clone()
-        };
-        output_items.push(OutputItem::FunctionCall(item::FunctionCall {
-            call_id: tc.id.clone(),
-            name: tc.name.clone(),
-            arguments: tc.arguments.clone(),
-            id: Some(fc_id),
-            namespace: None,
-            status: Some("completed".into()),
-        }));
-    }
-
-    if !state.accumulated_text.is_empty() {
-        let item_logprobs = if state.text_logprobs.is_empty() {
-            None
-        } else {
-            Some(state.text_logprobs.clone())
-        };
-        let msg_content = if state.accumulated_text.is_empty() {
-            vec![]
-        } else if state.has_refusal {
-            vec![OutputContentBlock::Refusal {
-                refusal: state.accumulated_text.clone(),
-            }]
-        } else {
-            vec![OutputContentBlock::Text {
-                text: state.accumulated_text.clone(),
-                annotations: vec![],
-                logprobs: item_logprobs,
-            }]
-        };
-        output_items.push(OutputItem::Message(item::OutputMessage {
-            id: state.msg_id.clone(),
-            role: "assistant".into(),
-            status: "completed".into(),
-            content: msg_content,
-            phase: None,
-        }));
-    }
+    // `close_*_item` above already pushed every still-open item into
+    // completed_items (in the right order), so it's the full output. Note:
+    // don't re-derive output items from `state`'s accumulators here even
+    // though they're still populated (intentionally not cleared — callers
+    // like the compaction path read `accumulated_text`/`reasoning_content`
+    // straight off the drained `StreamState` after this returns) — re-adding
+    // from them duplicates every item `close_*_item` already recorded.
+    let output_items: Vec<OutputItem> = state.completed_items.clone();
 
     // ── Build final Response ──────────────────────────────────────────────
-    let (final_status, incomplete_details) = match state.finish_reason.as_deref() {
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(super::responses::IncompleteDetails {
-                reason: super::responses::IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("content_filter") => (
-            ResponseStatus::Incomplete,
-            Some(super::responses::IncompleteDetails {
-                reason: super::responses::IncompleteReason::ContentFilter,
-            }),
-        ),
-        _ => (ResponseStatus::Completed, None),
+    let (final_status, incomplete_details) = if state.error.is_some() {
+        (ResponseStatus::Failed, None)
+    } else {
+        match state.finish_reason.as_deref() {
+            Some("length") => (
+                ResponseStatus::Incomplete,
+                Some(super::responses::IncompleteDetails {
+                    reason: super::responses::IncompleteReason::MaxOutputTokens,
+                }),
+            ),
+            Some("content_filter") => (
+                ResponseStatus::Incomplete,
+                Some(super::responses::IncompleteDetails {
+                    reason: super::responses::IncompleteReason::ContentFilter,
+                }),
+            ),
+            _ => (ResponseStatus::Completed, None),
+        }
     };
 
     let mut response = build_partial_response(state, final_status);
     response.output = output_items;
     response.incomplete_details = incomplete_details;
+    if let Some(ref error) = state.error {
+        response.error = Some(super::responses::Error {
+            code: error.code.clone(),
+            message: error.message.clone(),
+            r#type: None,
+            param: error.param.clone(),
+        });
+    }
 
     if let Some(ref usage) = state.usage {
-        response.usage = Some(super::responses::Usage::from(usage.clone()));
+        let mut u = super::responses::Usage::from(usage.clone());
+        // Scale input_tokens up for truncation before Codex sees it: Codex keys
+        // its client-side auto-compaction off the server-reported total_tokens.
+        crate::handlers::apply_input_char_scale(Some(&mut u), state.truncation_scale);
+        tracing::debug!(
+            input_tokens = u.input_tokens,
+            total_tokens = u.total_tokens,
+            scale = ?state.truncation_scale,
+            "reported usage"
+        );
+        response.usage = Some(u);
+    } else {
+        tracing::debug!("reported usage: none from upstream");
     }
 
     match final_status {
         ResponseStatus::Incomplete => {
             events.push(StreamEvent::Incomplete(event::Incomplete {
+                response,
+                sequence_number: next_seq(state),
+            }));
+        }
+        ResponseStatus::Failed => {
+            events.push(StreamEvent::Failed(event::Failed {
                 response,
                 sequence_number: next_seq(state),
             }));
@@ -889,8 +998,31 @@ fn emit_tool_call_deltas(
             state.tool_calls[idx].output_index
         };
 
+        // Determine custom-ness from the (possibly newly arriving) name before
+        // taking the mutable slot borrow. Codex declared these as custom tools;
+        // upstream returns them as function calls, so the client-facing item is
+        // emitted as `custom_tool_call`.
+        let is_custom = state.tool_calls[idx].is_custom
+            || tc
+                .function
+                .as_ref()
+                .and_then(|f| f.name.as_deref())
+                .map(|n| state.custom_tool_names.contains(n))
+                .unwrap_or(false);
+
+        // Same reasoning for the namespace tag: resolve from the (possibly
+        // newly arriving) name, falling back to what the slot already has.
+        let namespace = tc
+            .function
+            .as_ref()
+            .and_then(|f| f.name.as_deref())
+            .and_then(|n| state.tool_namespaces.get(n).cloned())
+            .or_else(|| state.tool_calls[idx].namespace.clone());
+
         // Now borrow the slot
         let slot = &mut state.tool_calls[idx];
+        slot.is_custom = is_custom;
+        slot.namespace = namespace.clone();
 
         // Capture id / name on first appearance
         if let Some(ref id) = tc.id {
@@ -908,18 +1040,33 @@ fn emit_tool_call_deltas(
         // Emit output_item.added on first appearance
         if first_time {
             slot.output_index = oi;
-            let fc_id = format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-            slot.fc_id.clone_from(&fc_id);
-            events.push(StreamEvent::OutputItemAdded(event::OutputItemAdded {
-                output_index: oi,
-                item: OutputItem::FunctionCall(item::FunctionCall {
+            let item_id = format!(
+                "{}_{}",
+                if is_custom { "ctc" } else { "fc" },
+                uuid::Uuid::new_v4().to_string().replace('-', "")
+            );
+            slot.fc_id.clone_from(&item_id);
+            let item = if is_custom {
+                OutputItem::CustomToolCall(item::CustomToolCall {
+                    call_id: slot.id.clone(),
+                    input: String::new(),
+                    name: slot.name.clone(),
+                    id: Some(item_id),
+                    namespace: namespace.clone(),
+                })
+            } else {
+                OutputItem::FunctionCall(item::FunctionCall {
                     call_id: slot.id.clone(),
                     name: slot.name.clone(),
                     arguments: String::new(),
-                    id: Some(fc_id),
-                    namespace: None,
+                    id: Some(item_id),
+                    namespace: namespace.clone(),
                     status: Some("in_progress".into()),
-                }),
+                })
+            };
+            events.push(StreamEvent::OutputItemAdded(event::OutputItemAdded {
+                output_index: oi,
+                item,
                 sequence_number: {
                     let s = local_seq;
                     local_seq += 1;
@@ -928,8 +1075,11 @@ fn emit_tool_call_deltas(
             }));
         }
 
-        // Emit arguments delta
-        if let Some(ref func) = tc.function
+        // Emit arguments delta. For custom tools we suppress per-chunk deltas
+        // (the arguments are the JSON `{ input }` wrapper, not the freeform
+        // input); the unwrapped input is emitted once at close.
+        if !is_custom
+            && let Some(ref func) = tc.function
             && let Some(ref args) = func.arguments
         {
             events.push(StreamEvent::FunctionCallArgumentsDelta(
