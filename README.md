@@ -66,6 +66,12 @@ server:
   # Overridden by RUST_LOG env var if set.
   log-level: info
 
+  # Maximum accepted request body size in bytes (default: 33554432, 32 MiB).
+  # The HTTP stack rejects larger bodies with 413 Payload Too Large before the
+  # proxy sees them. Raise it when long sessions, large tool outputs, or image
+  # parts trip "Failed to buffer the request body: length limit exceeded".
+  max-body-bytes: 33554432
+
   # Authentication – if any keys are set, auth is required
   auth:
     keys: []
