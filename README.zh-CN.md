@@ -66,6 +66,12 @@ server:
   # 可通过 RUST_LOG 环境变量覆盖。
   log-level: info
 
+  # 请求体最大字节数（默认 33554432，即 32 MiB）。
+  # 超过这个上限的请求会在进入 proxy 之前被 HTTP 层以 413 Payload Too Large 拒绝。
+  # 长会话、大的工具输出、图片分片触发
+  # "Failed to buffer the request body: length limit exceeded" 时调大它。
+  max-body-bytes: 33554432
+
   # 鉴权 — 只要 keys 非空即启用鉴权
   auth:
     keys: []
