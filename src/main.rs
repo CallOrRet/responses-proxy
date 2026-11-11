@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -68,6 +68,9 @@ async fn main() {
 
     let auth = middleware::from_fn_with_state(state.clone(), handlers::check);
     let listen = state.config().listen.to_string();
+    // axum defaults to 2 MiB for buffered bodies; long Codex sessions with tool
+    // output and image parts blow past that, so the cap comes from config.
+    let max_body_bytes = state.config().max_body_bytes;
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -91,9 +94,14 @@ async fn main() {
             post(handlers::cancel).route_layer(auth.clone()),
         )
         .layer(cors)
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state.clone());
 
-    tracing::info!("Listening on {}", listen);
+    tracing::info!(
+        "Listening on {} (max request body {} MiB)",
+        listen,
+        max_body_bytes / (1024 * 1024)
+    );
     let listener = tokio::net::TcpListener::bind(&listen).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

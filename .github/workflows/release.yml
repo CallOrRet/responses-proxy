@@ -25,21 +25,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
+          # linux: cross-built with zig against glibc 2.28, runs on
+          # RHEL/CentOS 8, Alibaba Cloud Linux, Debian 10+, Ubuntu 18.04+
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            archive: tar.gz
+            zig_target: aarch64-unknown-linux-gnu.2.28
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.28
+            os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
-            archive: zip
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +43,10 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Install cargo-zigbuild (linux)
+        if: runner.os == 'Linux'
+        run: pip3 install cargo-zigbuild
+
       - name: Show toolchain
         run: rustc -V && cargo -V
 
@@ -55,14 +54,35 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build release binary (linux, glibc 2.28)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --target ${{ matrix.zig_target }}
+
+      - name: Build release binary (darwin)
+        if: runner.os == 'macOS'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (unix)
-        if: matrix.archive == 'tar.gz'
+      # zigbuild writes to target/<plain triple>/release, not <triple>.<glibc>
+      - name: Verify ELF arch and max glibc symbol (linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
+          file "$BIN"
+          MAX=$(strings -a "$BIN" \
+            | grep -oE '^GLIBC_[0-9]+\.[0-9]+$' \
+            | sed 's/^GLIBC_//' | sort -V -u | tail -1 || true)
+          echo "highest glibc version required: ${MAX:-none}"
+          if [ -n "$MAX" ]; then
+            printf '%s\n2.28\n' "$MAX" | sort -V | tail -1 | grep -qx '2\.28' \
+              || { echo "::error::binary requires glibc newer than 2.28"; exit 1; }
+          fi
+
+      - name: Package (unix)
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -z "$tag" ] && tag="$GITHUB_REF_NAME"
           name="${BIN_NAME}-${tag}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$name/"
@@ -71,20 +91,6 @@ jobs:
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
           echo "ASSET_SHA=$name.tar.gz.sha256" >> "$GITHUB_ENV"
-
-      - name: Package (windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "${{ inputs.tag }}" }
-          $name = "${env:BIN_NAME}-$tag-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "$name/"
-          Copy-Item README.md, LICENSE, config.yaml "$name/"
-          Compress-Archive -Path $name -DestinationPath "$name.zip"
-          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
-          "ASSET=$name.zip"        | Out-File -Append -Encoding ascii $env:GITHUB_ENV
-          "ASSET_SHA=$name.zip.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''

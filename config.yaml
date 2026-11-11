@@ -19,6 +19,12 @@ server:
   # Optional. Default: info.
   log-level: info
 
+  # Maximum accepted request body size in bytes.
+  # Raise this if long sessions / image parts trigger
+  # "413 Payload Too Large ... length limit exceeded".
+  # Optional. Default: 33554432 (32 MiB).
+  max-body-bytes: 33554432
+
   # AES-256-GCM key for compact summary encryption (64 hex chars = 32 bytes).
   # Used by compaction flows when encrypted compaction payloads are present.
   # Empty string disables decryption/encryption support.
