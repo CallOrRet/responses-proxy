@@ -33,8 +33,15 @@ pub struct ServerConfig {
     pub allowed_tool_types: Vec<String>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Maximum accepted request body size in bytes (default 32 MiB).
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     #[serde(default)]
     pub compact_encryption_key: String,
+}
+
+fn default_max_body_bytes() -> usize {
+    32 * 1024 * 1024
 }
 
 fn default_log_level() -> String {
@@ -62,6 +69,7 @@ impl Default for ServerConfig {
             cors: CorsConfig::default(),
             allowed_tool_types: default_allowed_tool_types(),
             log_level: default_log_level(),
+            max_body_bytes: default_max_body_bytes(),
             compact_encryption_key: String::new(),
         }
     }
@@ -532,6 +540,7 @@ pub struct ResolvedConfig {
     pub cors_allow_origins: Vec<String>,
     pub allowed_tool_types: Vec<String>,
     pub log_level: String,
+    pub max_body_bytes: usize,
     pub models: HashMap<String, ResolvedProvider>,
     pub model_names: Vec<String>,
     pub compact_encryption_key: String,
@@ -614,6 +623,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         cors_allow_origins: config.server.cors.allow_origins,
         allowed_tool_types: config.server.allowed_tool_types,
         log_level: config.server.log_level,
+        max_body_bytes: config.server.max_body_bytes,
         models,
         model_names,
         compact_encryption_key: config.server.compact_encryption_key,

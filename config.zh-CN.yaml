@@ -19,6 +19,12 @@ server:
   # 可选。默认值：info。
   log-level: info
 
+  # 请求体最大字节数。
+  # 如果长会话 / 图片内容触发
+  # "413 Payload Too Large ... length limit exceeded"，调大这个值。
+  # 可选。默认值：33554432（32 MiB）。
+  max-body-bytes: 33554432
+
   # compact 摘要加密使用的 AES-256-GCM key（64 个十六进制字符 = 32 字节）。
   # 当 compaction 流程里出现加密 compact payload 时使用。
   # 空字符串表示关闭加密/解密支持。
